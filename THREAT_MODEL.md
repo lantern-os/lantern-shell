@@ -1,0 +1,23 @@
+# lantern-shell — Threat Model
+
+Inherits the [system threat model](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Threat-Model.md). The shell mediates
+consent, so its integrity affects whether the capability model is *usable* safely (system
+threats T4, T9).
+
+## Assets
+- Integrity of consent decisions (no grant without genuine user intent).
+- Capabilities the shell holds on the user's behalf.
+- Faithful presentation of held capabilities and the audit log.
+
+## Threats and mitigations
+| # | Threat | Mitigation |
+| --- | --- | --- |
+| SH1 | UI redress / spoofed consent prompt | Trusted-path presentation for consent; standard, recognisable capability shapes. |
+| SH2 | Consent fatigue → over-granting | Least-privilege defaults; bounded/scoped grants; meaningful (not click-through) prompts. |
+| SH3 | Compromised shell escalates authority | Shell is confined and cannot grant authority it doesn't hold; deny-by-default. |
+| SH4 | Misleading capability/audit display | Display derived from the actual held caps and the tamper-evident log, not self-reported. |
+| SH5 | Cross-persona linkage in the surface | Persona separation surfaced clearly ([Identity](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Identity.md)). |
+
+## Non-goals
+- Protecting a user who deliberately grants broad authority after a truthful prompt.
+- General GUI/compositor security beyond the consent trusted path (Phase 0 focus).

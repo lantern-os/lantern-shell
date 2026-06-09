@@ -1,0 +1,23 @@
+# Rust
+/target
+**/target
+Cargo.lock
+
+# Node / website tooling
+node_modules
+dist
+.next
+.cache
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Build artefacts
+*.img
+*.elf
+*.bin
+!**/docs/**/*.bin
