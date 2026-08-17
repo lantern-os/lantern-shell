@@ -6,6 +6,9 @@ agents, and where the [AI](https://github.com/lantern-os/lantern-docs/blob/main/
 
 - **Layer:** userland (confined user space).
 - **System context:** [wiki/Architecture](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Architecture.md), [wiki/AI](https://github.com/lantern-os/lantern-docs/blob/main/wiki/AI.md).
+- **Long-term direction:** the shell is also the eventual home of the Intent Interface and
+  Personal Agent surface described in [wiki/Intent-Model](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Intent-Model.md).
+  Current scope stays limited to the consent-broker role below; see [`STATUS.md`](./STATUS.md).
 
 > ⚠️ **Phase 0.** Design only; no code. See [`STATUS.md`](./STATUS.md).
 
