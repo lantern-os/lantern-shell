@@ -10,7 +10,7 @@ agents, and where the [AI](https://github.com/lantern-os/lantern-docs/blob/main/
   Personal Agent surface described in [wiki/Intent-Model](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Intent-Model.md).
   Current scope stays limited to the consent-broker role below; see [`STATUS.md`](./STATUS.md).
 
-> ⚠️ **Phase 0.** Design only; no code. See [`STATUS.md`](./STATUS.md).
+> ⚠️ **Phase 3** (RFC-0017/ADR-0021) — still design only; blocked on the confined-execution port carried forward from Phase 2. See [`STATUS.md`](./STATUS.md).
 
 ## In this repo
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`THREAT_MODEL.md`](./THREAT_MODEL.md), [`STATUS.md`](./STATUS.md).
