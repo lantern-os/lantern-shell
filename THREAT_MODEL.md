@@ -14,7 +14,7 @@ threats T4, T9).
 | --- | --- | --- |
 | SH1 | UI redress / spoofed consent prompt | Trusted-path presentation for consent; standard, recognisable capability shapes. |
 | SH2 | Consent fatigue → over-granting | Least-privilege defaults; bounded/scoped grants; meaningful (not click-through) prompts. |
-| SH3 | Compromised shell escalates authority | Shell is confined and cannot grant authority it doesn't hold; deny-by-default. |
+| SH3 | Compromised shell escalates authority | Shell is confined and cannot grant authority it doesn't hold; deny-by-default. The launch binder ([ADR-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0025-launch-binder.md)) can mint any `ops` on any object in the services it holds, but can't read key material, and parses only signed input. |
 | SH4 | Misleading capability/audit display | Display derived from the actual held caps and the tamper-evident log, not self-reported. |
 | SH5 | Cross-persona linkage in the surface | Persona separation surfaced clearly ([Identity](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Identity.md)). |
 

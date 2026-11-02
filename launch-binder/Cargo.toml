@@ -1,0 +1,33 @@
+[package]
+name = "lantern-launch-binder"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0020's launch binder: a confined riscv64 program, the only holder of authority to request grants from a service, which decides each of a signed package's manifest requests against a deny-by-default policy. Loaded by lantern-boot's runtime demos."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_launch_binder"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-launch-binder"
+path = "src/main.rs"
+# Bare-metal riscv64 only: there is no `test` crate for this target.
+test = false
+
+[dependencies]
+# Each its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
+lantern-filesystem = { git = "https://github.com/lantern-os/lantern-filesystem", branch = "main", default-features = false }
+# `no_std`: the `.lpkg` container + its signature check, and the manifest parser.
+lantern-sdk = { git = "https://github.com/lantern-os/lantern-sdk", branch = "main", default-features = false, features = ["manifest"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# `lantern-boot` embeds this ELF in its own kernel image (`lantern-boot/linker.ld`).
+strip = true
