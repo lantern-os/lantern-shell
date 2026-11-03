@@ -1,0 +1,30 @@
+[package]
+name = "lantern-policy-store"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0022's persistent policy store: a confined riscv64 service keeping an append-only log of revoked roles on flash, for the launch binder. It can only narrow what the compiled-in policy allows, and doesn't resist offline tampering. Loaded by lantern-boot's runtime demos."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_policy_store"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-policy-store"
+path = "src/main.rs"
+# Bare-metal riscv64 only: there is no `test` crate for this target.
+test = false
+
+[dependencies]
+# Each its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# `lantern-boot` embeds this ELF in its own kernel image (`lantern-boot/linker.ld`).
+strip = true
