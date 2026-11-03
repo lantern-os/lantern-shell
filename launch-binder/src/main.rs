@@ -8,6 +8,10 @@
 //!
 //! The holder of the control capability ([RFC-0021](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0021-grant-ledger-and-revocation.md))
 //! can list the ledger and revoke an entry. It names entries by index and never sees a badge.
+//!
+//! The policy store ([RFC-0022](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0022-persistent-revocation-store.md)) makes a
+//! revocation outlive a reboot. Before each grant, only its `OK` lets the grant proceed, so a corrupt or
+//! missing store declines everything. It can only narrow what [`POLICY`] allows.
 
 #![no_std]
 #![no_main]
@@ -17,8 +21,8 @@ extern crate alloc;
 
 use lantern_abi::frame::status;
 use lantern_abi::grant::{self, CONTROL_BADGE, CONTROL_LIST, CONTROL_REVOKE};
-use lantern_abi::sys;
-use lantern_launch_binder::{decide, read_package, BoundSlots, Interface, Ledger, MAX_BINDS, POLICY, TRUSTED_PUBLISHERS};
+use lantern_abi::{policy, sys};
+use lantern_launch_binder::{decide, read_package, revocation_key, BoundSlots, Interface, Ledger, MAX_BINDS, POLICY, TRUSTED_PUBLISHERS};
 
 /// What the launcher grants: this program's endpoint for `BIND`, and each service's endpoint
 /// under `GRANTER_BADGE`. A slot with nothing in it declines that interface.
@@ -27,6 +31,8 @@ const KEYSTORE_GRANTER_CPTR: usize = 2;
 const STORE_GRANTER_CPTR: usize = 3;
 /// The first of [`MAX_BINDS`] slots where obtained badges land, and stay.
 const GRANT_CPTR_BASE: usize = 4;
+/// The policy store's endpoint. Only this program holds one.
+const POLICY_STORE_CPTR: usize = GRANT_CPTR_BASE + MAX_BINDS;
 
 /// Must equal `lantern_boot::launch::HEAP_VADDR`, sized by the loader's `heap_megapages`.
 const HEAP_BASE: usize = 0x8620_0000;
@@ -63,12 +69,16 @@ fn run(package_len: usize) -> ! {
         let granted = bound.claim(interface, slot).zip(Interface::from_wire(interface)).and_then(|(index, interface)| {
             let (publisher, plan) = package.as_ref()?;
             let binding = decide(publisher, plan, POLICY, interface, slot)?;
+            let key = revocation_key(publisher, plan, interface, slot)?;
+            if policy::is_revoked(POLICY_STORE_CPTR, key).ok()? != status::OK {
+                return None;
+            }
             let dest = GRANT_CPTR_BASE + index;
             let (status, badge) =
                 grant::request_grant(granter(interface), dest, binding.object as usize, binding.ops as usize).ok()?;
             (status == status::OK).then(|| {
                 // `decide` refuses a slot that doesn't fit.
-                ledger.record(index, interface, slot as u8, binding, badge);
+                ledger.record(index, interface, slot as u8, binding, badge, key);
                 dest
             })
         });
@@ -91,11 +101,18 @@ fn serve_control(ledger: &mut Ledger, (op, index): (usize, usize)) {
     let words = match (op, entry) {
         (CONTROL_LIST, Some(entry)) => entry.listed().to_words(),
         (CONTROL_REVOKE, Some(entry)) => {
+            // Recorded first, so a crash from here on means declined next boot, the safe direction.
+            // A failure to record doesn't stop the revocation: the holder asked for it to end now.
+            let recorded = policy::record(POLICY_STORE_CPTR, entry.key) == Ok(status::OK);
+            if recorded {
+                ledger.mark_durable(index);
+            }
             // The ledger changes only on the service's `OK`; anything else is reported as it is.
-            let status = grant::request_revoke(granter(entry.interface), entry.badge).unwrap_or(status::FAILED);
-            if status == status::OK {
+            let revoked = grant::request_revoke(granter(entry.interface), entry.badge).unwrap_or(status::FAILED);
+            if revoked == status::OK {
                 ledger.mark_revoked(index);
             }
+            let status = if revoked == status::OK && !recorded { status::FAILED } else { revoked };
             [status as usize, 0]
         }
         _ => [status::INVALID as usize, 0],
@@ -103,4 +120,4 @@ fn serve_control(ledger: &mut Ledger, (op, index): (usize, usize)) {
     let _ = sys::reply([0, words[0], words[1]]);
 }
 
-const _: () = assert!(GRANT_CPTR_BASE + MAX_BINDS <= 32);
+const _: () = assert!(POLICY_STORE_CPTR < 32);

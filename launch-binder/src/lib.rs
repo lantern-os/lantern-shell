@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use lantern_abi::grant::{ListedGrant, INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
+use lantern_abi::policy::RevocationKey;
 use lantern_crypto::KeyOps;
 use lantern_filesystem::FileOps;
 use lantern_sdk::plan::ResourceRequest;
@@ -143,6 +144,31 @@ pub fn decide(
     (ops & !entry.approved_ops == 0).then_some(Binding { object: entry.object, ops })
 }
 
+/// What a revocation of this role means, for the policy store ([RFC-0022](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0022-persistent-revocation-store.md)):
+/// the same across boots, unlike a ledger index or a badge. `None` if the plan has no such slot.
+pub fn revocation_key(publisher: &PublisherKey, plan: &GrantPlan, interface: Interface, slot: usize) -> Option<RevocationKey> {
+    let requests = match interface {
+        Interface::Keystore => &plan.keystore,
+        Interface::Filesystem => &plan.filesystem,
+    };
+    Some(key_for(publisher, &plan.app.name, interface, &requests.get(slot)?.role))
+}
+
+/// Lengths keep `("ab", "c")` and `("a", "bc")` apart.
+fn key_for(publisher: &PublisherKey, app: &str, interface: Interface, role: &str) -> RevocationKey {
+    let mut hasher = lantern_crypto::hash::Hasher::new();
+    hasher
+        .update(publisher)
+        .update(&(app.len() as u64).to_le_bytes())
+        .update(app.as_bytes())
+        .update(&(interface.to_wire() as u64).to_le_bytes())
+        .update(&(role.len() as u64).to_le_bytes())
+        .update(role.as_bytes());
+    let digest = hasher.finalize();
+    let bytes = digest.as_bytes();
+    [u64::from_le_bytes(bytes[..8].try_into().unwrap()), u64::from_le_bytes(bytes[8..16].try_into().unwrap())]
+}
+
 /// A role's validated `ops` names as bits. `None` for a name this binder has no bit for, or
 /// for no ops at all, either of which it won't mint.
 fn ops_bits(interface: Interface, request: &ResourceRequest) -> Option<u8> {
@@ -195,7 +221,10 @@ pub struct LedgerEntry {
     pub binding: Binding,
     /// Never leaves this program: it is what `REVOKE` names to the service.
     pub badge: u64,
+    /// What `RECORD` names to the policy store.
+    pub key: RevocationKey,
     pub revoked: bool,
+    pub durable: bool,
 }
 
 impl LedgerEntry {
@@ -206,13 +235,14 @@ impl LedgerEntry {
             object: self.binding.object,
             ops: self.binding.ops,
             revoked: self.revoked,
+            durable: self.durable,
         }
     }
 }
 
 /// What this launch granted, indexed as [`BoundSlots::claim`] numbered it. A declined request
-/// leaves its index empty. It lives in memory, so **a revocation lasts only until the next
-/// boot**, when [`POLICY`] grants the same thing again.
+/// leaves its index empty. It lives in memory: what outlives a reboot is the policy store's record
+/// of a revocation, which [`LedgerEntry::durable`] reports.
 #[derive(Default)]
 pub struct Ledger {
     entries: [Option<LedgerEntry>; MAX_BINDS],
@@ -220,9 +250,9 @@ pub struct Ledger {
 
 impl Ledger {
     /// Call only after the service answered `OK`.
-    pub fn record(&mut self, index: usize, interface: Interface, slot: u8, binding: Binding, badge: u64) {
+    pub fn record(&mut self, index: usize, interface: Interface, slot: u8, binding: Binding, badge: u64, key: RevocationKey) {
         if let Some(entry) = self.entries.get_mut(index) {
-            *entry = Some(LedgerEntry { interface, slot, binding, badge, revoked: false });
+            *entry = Some(LedgerEntry { interface, slot, binding, badge, key, revoked: false, durable: false });
         }
     }
 
@@ -235,6 +265,13 @@ impl Ledger {
     pub fn mark_revoked(&mut self, index: usize) {
         if let Some(Some(entry)) = self.entries.get_mut(index) {
             entry.revoked = true;
+        }
+    }
+
+    /// Call only after the policy store answered `OK`.
+    pub fn mark_durable(&mut self, index: usize) {
+        if let Some(Some(entry)) = self.entries.get_mut(index) {
+            entry.durable = true;
         }
     }
 }
@@ -360,7 +397,7 @@ mod tests {
         assert_eq!(ledger.get(0), None);
 
         let binding = Binding { object: 7, ops: KeyOps::SIGN.bits() };
-        ledger.record(2, Interface::Keystore, 1, binding, 0xabcd);
+        ledger.record(2, Interface::Keystore, 1, binding, 0xabcd, [1, 2]);
         assert_eq!(ledger.get(0), None, "other indexes stay empty");
 
         let entry = ledger.get(2).unwrap();
@@ -368,7 +405,7 @@ mod tests {
         let listed = entry.listed();
         assert_eq!(
             listed,
-            ListedGrant { interface: INTERFACE_KEYSTORE as u8, slot: 1, object: 7, ops: KeyOps::SIGN.bits(), revoked: false }
+            ListedGrant { interface: INTERFACE_KEYSTORE as u8, slot: 1, object: 7, ops: KeyOps::SIGN.bits(), revoked: false, durable: false }
         );
         assert!(!listed.to_words().contains(&0xabcd));
     }
@@ -377,8 +414,8 @@ mod tests {
     fn marking_revoked_touches_one_entry_and_tolerates_a_bad_index() {
         let mut ledger = Ledger::default();
         let binding = Binding { object: 0, ops: 1 };
-        ledger.record(0, Interface::Keystore, 0, binding, 1);
-        ledger.record(1, Interface::Filesystem, 0, binding, 2);
+        ledger.record(0, Interface::Keystore, 0, binding, 1, [1, 1]);
+        ledger.record(1, Interface::Filesystem, 0, binding, 2, [2, 2]);
 
         ledger.mark_revoked(0);
         ledger.mark_revoked(3);
@@ -390,9 +427,44 @@ mod tests {
     }
 
     #[test]
+    fn durable_is_separate_from_revoked() {
+        let mut ledger = Ledger::default();
+        ledger.record(0, Interface::Keystore, 0, Binding { object: 0, ops: 1 }, 1, [1, 1]);
+        ledger.mark_revoked(0);
+        assert!(!ledger.get(0).unwrap().durable);
+        ledger.mark_durable(0);
+        assert!(ledger.get(0).unwrap().listed().durable);
+    }
+
+    #[test]
+    fn a_revocation_key_distinguishes_every_part_of_what_it_means() {
+        let key = key_for(&DEMO_PUBLISHER, "app", Interface::Keystore, "role");
+        assert_eq!(key, key_for(&DEMO_PUBLISHER, "app", Interface::Keystore, "role"));
+        assert_ne!(key, key_for(&OTHER_DEMO_PUBLISHER, "app", Interface::Keystore, "role"));
+        assert_ne!(key, key_for(&DEMO_PUBLISHER, "other", Interface::Keystore, "role"));
+        assert_ne!(key, key_for(&DEMO_PUBLISHER, "app", Interface::Filesystem, "role"));
+        assert_ne!(key, key_for(&DEMO_PUBLISHER, "app", Interface::Keystore, "other"));
+        assert_ne!(
+            key_for(&DEMO_PUBLISHER, "ab", Interface::Keystore, "c"),
+            key_for(&DEMO_PUBLISHER, "a", Interface::Keystore, "bc"),
+        );
+    }
+
+    #[test]
+    fn a_revocation_key_needs_a_declared_slot() {
+        let m = manifest("confined-probe", "keystore.key", "probe-signing", "\"sign\"");
+        let (publisher, plan) = read_package(&lpkg(0x4c, &m), TRUSTED_PUBLISHERS).unwrap();
+        assert_eq!(
+            revocation_key(&publisher, &plan, Interface::Keystore, 0),
+            Some(key_for(&publisher, "confined-probe", Interface::Keystore, "probe-signing")),
+        );
+        assert_eq!(revocation_key(&publisher, &plan, Interface::Keystore, 1), None);
+    }
+
+    #[test]
     fn an_out_of_range_record_is_dropped() {
         let mut ledger = Ledger::default();
-        ledger.record(MAX_BINDS, Interface::Keystore, 0, Binding { object: 0, ops: 1 }, 1);
+        ledger.record(MAX_BINDS, Interface::Keystore, 0, Binding { object: 0, ops: 1 }, 1, [1, 1]);
         assert!((0..MAX_BINDS).all(|index| ledger.get(index).is_none()));
     }
 

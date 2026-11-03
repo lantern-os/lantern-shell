@@ -7,7 +7,7 @@
 //! 1. Lists ledger entry 0, and checks it is the grant it expects, not yet revoked.
 //! 2. Checks an empty and an out-of-range index are both reported as such.
 //! 3. Sends a stranger's request to the service, which must answer `BUSY`.
-//! 4. Revokes entry 0, and checks the ledger now says so.
+//! 4. Revokes entry 0, and checks the ledger now says so, and that it is durable.
 //! 5. Revokes it again, which must also succeed.
 //!
 //! Then it signals back. Any failed check signals `FAILURE` instead, with the step in `detail`.
@@ -60,7 +60,7 @@ fn run(arg0: usize) -> ! {
 
 fn script(interface: u8, ops: u8) -> Result<(), usize> {
     let entry = grant::list(CONTROL_CPTR, 0).map_err(|_| 1usize)?.ok_or(1usize)?;
-    if entry.interface != interface || entry.slot != 0 || entry.ops != ops || entry.revoked {
+    if entry.interface != interface || entry.slot != 0 || entry.ops != ops || entry.revoked || entry.durable {
         return Err(1);
     }
 
@@ -81,7 +81,7 @@ fn script(interface: u8, ops: u8) -> Result<(), usize> {
     if !matches!(grant::revoke(CONTROL_CPTR, 0), Ok(status::OK)) {
         return Err(4);
     }
-    if !matches!(grant::list(CONTROL_CPTR, 0), Ok(Some(entry)) if entry.revoked) {
+    if !matches!(grant::list(CONTROL_CPTR, 0), Ok(Some(entry)) if entry.revoked && entry.durable) {
         return Err(4);
     }
 
