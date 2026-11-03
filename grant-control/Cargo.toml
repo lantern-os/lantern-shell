@@ -1,0 +1,25 @@
+[package]
+name = "lantern-grant-control"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0021's v0 holder of the launch binder's control capability: a scripted confined riscv64 program that lists and revokes a grant. It stands in for a future shell and is not a user interface. Loaded by lantern-boot's runtime demos."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "lantern-grant-control"
+path = "src/main.rs"
+# Bare-metal riscv64 only: there is no `test` crate for this target.
+test = false
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# `lantern-boot` embeds this ELF in its own kernel image (`lantern-boot/linker.ld`).
+strip = true
