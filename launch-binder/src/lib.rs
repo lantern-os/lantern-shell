@@ -11,7 +11,7 @@
 
 extern crate alloc;
 
-use lantern_abi::grant::{INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
+use lantern_abi::grant::{ListedGrant, INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
 use lantern_crypto::KeyOps;
 use lantern_filesystem::FileOps;
 use lantern_sdk::plan::ResourceRequest;
@@ -52,6 +52,13 @@ impl Interface {
             INTERFACE_KEYSTORE => Some(Self::Keystore),
             INTERFACE_FILESYSTEM => Some(Self::Filesystem),
             _ => None,
+        }
+    }
+
+    pub fn to_wire(self) -> usize {
+        match self {
+            Self::Keystore => INTERFACE_KEYSTORE,
+            Self::Filesystem => INTERFACE_FILESYSTEM,
         }
     }
 }
@@ -117,6 +124,10 @@ pub fn decide(
     interface: Interface,
     slot: usize,
 ) -> Option<Binding> {
+    // `LIST` reports a slot in 8 bits.
+    if slot > u8::MAX as usize {
+        return None;
+    }
     let requests = match interface {
         Interface::Keystore => &plan.keystore,
         Interface::Filesystem => &plan.filesystem,
@@ -173,6 +184,58 @@ impl BoundSlots {
         let free = self.taken.iter().position(Option::is_none)?;
         self.taken[free] = Some((interface, slot));
         Some(free)
+    }
+}
+
+/// A granted request, as the binder remembers it (RFC-0021).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LedgerEntry {
+    pub interface: Interface,
+    pub slot: u8,
+    pub binding: Binding,
+    /// Never leaves this program: it is what `REVOKE` names to the service.
+    pub badge: u64,
+    pub revoked: bool,
+}
+
+impl LedgerEntry {
+    pub fn listed(&self) -> ListedGrant {
+        ListedGrant {
+            interface: self.interface.to_wire() as u8,
+            slot: self.slot,
+            object: self.binding.object,
+            ops: self.binding.ops,
+            revoked: self.revoked,
+        }
+    }
+}
+
+/// What this launch granted, indexed as [`BoundSlots::claim`] numbered it. A declined request
+/// leaves its index empty. It lives in memory, so **a revocation lasts only until the next
+/// boot**, when [`POLICY`] grants the same thing again.
+#[derive(Default)]
+pub struct Ledger {
+    entries: [Option<LedgerEntry>; MAX_BINDS],
+}
+
+impl Ledger {
+    /// Call only after the service answered `OK`.
+    pub fn record(&mut self, index: usize, interface: Interface, slot: u8, binding: Binding, badge: u64) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            *entry = Some(LedgerEntry { interface, slot, binding, badge, revoked: false });
+        }
+    }
+
+    pub fn get(&self, index: usize) -> Option<&LedgerEntry> {
+        self.entries.get(index)?.as_ref()
+    }
+
+    /// Call only after the service answered `OK`, so the ledger never claims a revocation that
+    /// didn't happen.
+    pub fn mark_revoked(&mut self, index: usize) {
+        if let Some(Some(entry)) = self.entries.get_mut(index) {
+            entry.revoked = true;
+        }
     }
 }
 
@@ -282,6 +345,55 @@ mod tests {
         assert_eq!(bound.claim(INTERFACE_KEYSTORE, 1), Some(2));
         assert_eq!(bound.claim(INTERFACE_KEYSTORE, 2), Some(3));
         assert_eq!(bound.claim(INTERFACE_KEYSTORE, 3), None);
+    }
+
+    #[test]
+    fn a_slot_list_cant_report_is_declined() {
+        let m = manifest("confined-probe", "keystore.key", "probe-signing", "\"sign\"");
+        let (publisher, plan) = read_package(&lpkg(0x4c, &m), TRUSTED_PUBLISHERS).unwrap();
+        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Keystore, 256), None);
+    }
+
+    #[test]
+    fn the_ledger_lists_what_was_recorded_without_the_badge() {
+        let mut ledger = Ledger::default();
+        assert_eq!(ledger.get(0), None);
+
+        let binding = Binding { object: 7, ops: KeyOps::SIGN.bits() };
+        ledger.record(2, Interface::Keystore, 1, binding, 0xabcd);
+        assert_eq!(ledger.get(0), None, "other indexes stay empty");
+
+        let entry = ledger.get(2).unwrap();
+        assert_eq!(entry.badge, 0xabcd);
+        let listed = entry.listed();
+        assert_eq!(
+            listed,
+            ListedGrant { interface: INTERFACE_KEYSTORE as u8, slot: 1, object: 7, ops: KeyOps::SIGN.bits(), revoked: false }
+        );
+        assert!(!listed.to_words().contains(&0xabcd));
+    }
+
+    #[test]
+    fn marking_revoked_touches_one_entry_and_tolerates_a_bad_index() {
+        let mut ledger = Ledger::default();
+        let binding = Binding { object: 0, ops: 1 };
+        ledger.record(0, Interface::Keystore, 0, binding, 1);
+        ledger.record(1, Interface::Filesystem, 0, binding, 2);
+
+        ledger.mark_revoked(0);
+        ledger.mark_revoked(3);
+        ledger.mark_revoked(99);
+        assert!(ledger.get(0).unwrap().revoked);
+        assert!(!ledger.get(1).unwrap().revoked);
+        assert_eq!(ledger.get(3), None);
+        assert_eq!(ledger.get(99), None);
+    }
+
+    #[test]
+    fn an_out_of_range_record_is_dropped() {
+        let mut ledger = Ledger::default();
+        ledger.record(MAX_BINDS, Interface::Keystore, 0, Binding { object: 0, ops: 1 }, 1);
+        assert!((0..MAX_BINDS).all(|index| ledger.get(index).is_none()));
     }
 
     #[test]
