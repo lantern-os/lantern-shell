@@ -31,8 +31,12 @@
 - **Replace the binder's compiled-in policy and `grant-control` with real consent**, which needs a trusted-path
   surface. That's what's left of the Phase 3 exit criterion's "visible, revocable capability set": no person sees
   or decides anything yet. The store then has to hold grants too, and can no longer only narrow (RFC-0022).
-- **A hardware root of trust**, so the log resists offline tampering and rollback, and a recovery path for a corrupt store.
+- A recovery path for a corrupt store.
 - Design the consent UX and standard capability shapes (with [`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime) and [`lantern-sdk`](https://github.com/lantern-os/lantern-sdk)).
+
+## Phase 4
+- **A hardware root of trust**, so the log resists offline tampering and rollback, on
+  [RFC-0023](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0023-hardware-key-custody-in-phase-4.md)'s checklist.
 
 ## Blocked on
 - Audit log ([`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime)).
