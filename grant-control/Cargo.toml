@@ -15,6 +15,8 @@ test = false
 [dependencies]
 # Its own `lantern-os` repo.
 lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+# The same chain the store computes, in the same repo.
+lantern-policy-store = { path = "../policy-store" }
 
 [profile.dev]
 panic = "abort"
