@@ -12,7 +12,7 @@
 extern crate alloc;
 
 use lantern_abi::grant::{ListedGrant, INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
-use lantern_abi::policy::RevocationKey;
+use lantern_abi::policy::{reason, RevocationKey};
 use lantern_crypto::KeyOps;
 use lantern_filesystem::FileOps;
 use lantern_sdk::plan::ResourceRequest;
@@ -114,7 +114,8 @@ pub fn read_package(lpkg: &[u8], trusted: &[PublisherKey]) -> Option<(PublisherK
     Some((publisher, manifest.plan()))
 }
 
-/// RFC-0020's decision, less "already bound" ([`BoundSlots`]) and the service's own answer.
+/// RFC-0020's decision, less "already bound" ([`BoundSlots`]) and the service's own answer. A decline
+/// carries its `lantern_abi::policy::reason`, for the audit log only (RFC-0024): the runtime isn't told.
 /// Grants only for an exact policy match whose approved ops cover everything the role asks
 /// for. A request beyond what's approved is declined, never narrowed: an app that gets less
 /// than it declared should see `none`, not a handle that fails later.
@@ -124,24 +125,27 @@ pub fn decide(
     policy: &[PolicyEntry],
     interface: Interface,
     slot: usize,
-) -> Option<Binding> {
+) -> Result<Binding, u8> {
     // `LIST` reports a slot in 8 bits.
     if slot > u8::MAX as usize {
-        return None;
+        return Err(reason::NOT_DECLARED);
     }
     let requests = match interface {
         Interface::Keystore => &plan.keystore,
         Interface::Filesystem => &plan.filesystem,
     };
-    let request = requests.get(slot)?;
-    let entry = policy.iter().find(|entry| {
-        entry.publisher == *publisher
-            && entry.interface == interface
-            && entry.app == plan.app.name
-            && entry.role == request.role
-    })?;
-    let ops = ops_bits(interface, request)?;
-    (ops & !entry.approved_ops == 0).then_some(Binding { object: entry.object, ops })
+    let request = requests.get(slot).ok_or(reason::NOT_DECLARED)?;
+    let entry = policy
+        .iter()
+        .find(|entry| {
+            entry.publisher == *publisher
+                && entry.interface == interface
+                && entry.app == plan.app.name
+                && entry.role == request.role
+        })
+        .ok_or(reason::NOT_IN_POLICY)?;
+    let ops = ops_bits(interface, request).ok_or(reason::OPS_EXCEED_POLICY)?;
+    (ops & !entry.approved_ops == 0).then_some(Binding { object: entry.object, ops }).ok_or(reason::OPS_EXCEED_POLICY)
 }
 
 /// What a revocation of this role means, for the policy store ([RFC-0022](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0022-persistent-revocation-store.md)):
@@ -298,7 +302,7 @@ mod tests {
 
     fn decide_keystore(seed: u8, manifest: &str) -> Option<Binding> {
         let (publisher, plan) = read_package(&lpkg(seed, manifest), TRUSTED_PUBLISHERS)?;
-        decide(&publisher, &plan, POLICY, Interface::Keystore, 0)
+        decide(&publisher, &plan, POLICY, Interface::Keystore, 0).ok()
     }
 
     #[test]
@@ -327,6 +331,18 @@ mod tests {
             let m = manifest("confined-probe", "keystore.key", "probe-signing", ops);
             assert_eq!(decide_keystore(0x4c, &m), None, "{ops}");
         }
+    }
+
+    #[test]
+    fn each_decline_carries_its_reason() {
+        let read = |seed, m: &str| read_package(&lpkg(seed, m), TRUSTED_PUBLISHERS).unwrap();
+        let reason_for = |seed, m: &str| {
+            let (publisher, plan) = read(seed, m);
+            decide(&publisher, &plan, POLICY, Interface::Keystore, 0).unwrap_err()
+        };
+        assert_eq!(reason_for(0x4c, &manifest("other-app", "keystore.key", "probe-signing", "\"sign\"")), reason::NOT_IN_POLICY);
+        assert_eq!(reason_for(0x4d, &manifest("confined-probe", "keystore.key", "probe-signing", "\"sign\"")), reason::NOT_IN_POLICY);
+        assert_eq!(reason_for(0x4c, &manifest("confined-probe", "keystore.key", "probe-signing", "\"decrypt\"")), reason::OPS_EXCEED_POLICY);
     }
 
     #[test]
@@ -362,15 +378,15 @@ mod tests {
     fn an_undeclared_slot_or_the_wrong_interface_is_declined() {
         let m = manifest("confined-probe", "keystore.key", "probe-signing", "\"sign\"");
         let (publisher, plan) = read_package(&lpkg(0x4c, &m), TRUSTED_PUBLISHERS).unwrap();
-        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Keystore, 1), None);
-        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Filesystem, 0), None);
+        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Keystore, 1), Err(reason::NOT_DECLARED));
+        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Filesystem, 0), Err(reason::NOT_DECLARED));
     }
 
     #[test]
     fn an_empty_policy_declines_everything() {
         let m = manifest("confined-probe", "keystore.key", "probe-signing", "\"sign\"");
         let (publisher, plan) = read_package(&lpkg(0x4c, &m), TRUSTED_PUBLISHERS).unwrap();
-        assert_eq!(decide(&publisher, &plan, &[], Interface::Keystore, 0), None);
+        assert_eq!(decide(&publisher, &plan, &[], Interface::Keystore, 0), Err(reason::NOT_IN_POLICY));
     }
 
     #[test]
@@ -388,7 +404,7 @@ mod tests {
     fn a_slot_list_cant_report_is_declined() {
         let m = manifest("confined-probe", "keystore.key", "probe-signing", "\"sign\"");
         let (publisher, plan) = read_package(&lpkg(0x4c, &m), TRUSTED_PUBLISHERS).unwrap();
-        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Keystore, 256), None);
+        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Keystore, 256), Err(reason::NOT_DECLARED));
     }
 
     #[test]

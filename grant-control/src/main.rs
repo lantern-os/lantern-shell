@@ -9,6 +9,9 @@
 //! 3. Sends a stranger's request to the service, which must answer `BUSY`.
 //! 4. Revokes entry 0, and checks the ledger now says so, and that it is durable.
 //! 5. Revokes it again, which must also succeed.
+//! 6. Checks its read-only audit capability can't append ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)).
+//! 7. Reads the whole audit log and recomputes the chain, which must reach the store's head.
+//! 8. Checks this boot's records: a grant, the runtime's declined self-check, and both revocations.
 //!
 //! Then it signals back. Any failed check signals `FAILURE` instead, with the step in `detail`.
 //! Step 4 returning at all shows the service served `REVOKE` during the open exchange.
@@ -19,7 +22,9 @@
 
 use lantern_abi::frame::status;
 use lantern_abi::grant;
+use lantern_abi::policy::{self, event, reason, AuditEntry};
 use lantern_abi::sys;
+use lantern_policy_store::audit::{chain, GENESIS};
 
 /// The binder's endpoint, under `CONTROL_BADGE`.
 const CONTROL_CPTR: usize = 1;
@@ -30,6 +35,8 @@ const STRANGER_CPTR: usize = 2;
 const FAILURE_CPTR: usize = 4;
 const REQUEST_CPTR: usize = 5;
 const DONE_CPTR: usize = 6;
+/// The policy store's endpoint under `READER_BADGE`: the audit log, read-only.
+const READER_CPTR: usize = 7;
 
 /// `confined-runtime`'s `Stage::Control`, in a `Signal`'s `a1`.
 const STAGE_CONTROL: usize = 12;
@@ -88,5 +95,55 @@ fn script(interface: u8, ops: u8) -> Result<(), usize> {
     if !matches!(grant::revoke(CONTROL_CPTR, 0), Ok(status::OK)) {
         return Err(5);
     }
+
+    if !matches!(policy::append(READER_CPTR, &AuditEntry { event: event::GRANTING, ..AuditEntry::default() }), Ok(status::ACCESS)) {
+        return Err(6);
+    }
+
+    let (status, count, head) = policy::head(READER_CPTR).map_err(|_| 7usize)?;
+    if status != status::OK {
+        return Err(7);
+    }
+    let mut chained = GENESIS;
+    let mut last_boot = None;
+    for index in 0..count {
+        let entry = read(index).ok_or(7usize)?;
+        chained = chain(chained, &entry, index);
+        if entry.event == event::BOOT {
+            last_boot = Some(index);
+        }
+    }
+    if chained != head {
+        return Err(7);
+    }
+
+    // This boot, after its own `BOOT`. Repeated attempts at a bound slot aren't recorded.
+    let expected = [
+        (event::GRANTING, reason::NONE, interface, ops),
+        (event::DECLINED, reason::NOT_DECLARED, 0, 0),
+        (event::REVOKING, reason::NONE, interface, ops),
+        (event::REVOKING, reason::NONE, interface, ops),
+    ];
+    let first = last_boot.ok_or(8usize)? + 1;
+    if count - first != expected.len() as u64 {
+        return Err(8);
+    }
+    for (offset, &(event, reason, interface, ops)) in expected.iter().enumerate() {
+        let entry = read(first + offset as u64).ok_or(8usize)?;
+        let matches = entry.event == event
+            && entry.reason == reason
+            && entry.slot == 0
+            && (interface == 0 || entry.interface == interface && entry.ops == ops);
+        if !matches {
+            return Err(8);
+        }
+    }
     Ok(())
+}
+
+fn read(index: u64) -> Option<AuditEntry> {
+    match policy::read(READER_CPTR, index) {
+        Ok((status::OK, entry)) => Some(entry),
+        _ => None,
+    }
 }

@@ -12,6 +12,11 @@
 //! The policy store ([RFC-0022](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0022-persistent-revocation-store.md)) makes a
 //! revocation outlive a reboot. Before each grant, only its `OK` lets the grant proceed, so a corrupt or
 //! missing store declines everything. It can only narrow what [`POLICY`] allows.
+//!
+//! The audit log ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)) records every grant, decline and
+//! revocation, with the reason the runtime isn't told. **A grant is recorded before it's attempted**, so an
+//! unrecorded grant can't happen, and a log that can't take the record declines it. A revocation is never
+//! blocked by the log.
 
 #![no_std]
 #![no_main]
@@ -21,8 +26,12 @@ extern crate alloc;
 
 use lantern_abi::frame::status;
 use lantern_abi::grant::{self, CONTROL_BADGE, CONTROL_LIST, CONTROL_REVOKE};
+use lantern_abi::policy::{event, reason, AuditEntry};
 use lantern_abi::{policy, sys};
-use lantern_launch_binder::{decide, read_package, revocation_key, BoundSlots, Interface, Ledger, MAX_BINDS, POLICY, TRUSTED_PUBLISHERS};
+use lantern_launch_binder::{
+    decide, read_package, revocation_key, BoundSlots, Interface, Ledger, PublisherKey, MAX_BINDS, POLICY, TRUSTED_PUBLISHERS,
+};
+use lantern_sdk::GrantPlan;
 
 /// What the launcher grants: this program's endpoint for `BIND`, and each service's endpoint
 /// under `GRANTER_BADGE`. A slot with nothing in it declines that interface.
@@ -66,26 +75,65 @@ fn run(package_len: usize) -> ! {
             continue;
         }
         let (interface, slot) = grant::bind_request(&received);
-        let granted = bound.claim(interface, slot).zip(Interface::from_wire(interface)).and_then(|(index, interface)| {
-            let (publisher, plan) = package.as_ref()?;
-            let binding = decide(publisher, plan, POLICY, interface, slot)?;
-            let key = revocation_key(publisher, plan, interface, slot)?;
-            if policy::is_revoked(POLICY_STORE_CPTR, key).ok()? != status::OK {
-                return None;
-            }
-            let dest = GRANT_CPTR_BASE + index;
-            let (status, badge) =
-                grant::request_grant(granter(interface), dest, binding.object as usize, binding.ops as usize).ok()?;
-            (status == status::OK).then(|| {
-                // `decide` refuses a slot that doesn't fit.
-                ledger.record(index, interface, slot as u8, binding, badge, key);
-                dest
-            })
-        });
+        // Only a slot's first attempt is decided, or recorded: a caller can't fill the log by repeating one.
+        let granted = bound.claim(interface, slot).and_then(|index| bind(&package, &mut ledger, index, interface, slot));
         let _ = match granted {
             Some(dest) => grant::reply_granted(dest),
             None => grant::reply_declined(),
         };
+    }
+}
+
+/// One first attempt at `(interface, slot)`: `Some` with the capability's slot if granted. Every outcome is
+/// recorded except one the log itself refused.
+fn bind(
+    package: &Option<(PublisherKey, GrantPlan)>,
+    ledger: &mut Ledger,
+    index: usize,
+    interface_word: usize,
+    slot: usize,
+) -> Option<usize> {
+    let mut entry =
+        AuditEntry { event: event::DECLINED, interface: interface_word as u8, slot: slot as u8, ..AuditEntry::default() };
+    // `Err(Some(reason))` is recorded as a decline; `Err(None)` has been recorded already, or can't be.
+    let mut attempt = || -> Result<usize, Option<u8>> {
+        let interface = Interface::from_wire(interface_word).ok_or(reason::NOT_DECLARED)?;
+        let (publisher, plan) = package.as_ref().ok_or(reason::UNVERIFIED_PACKAGE)?;
+        if let Some(key) = revocation_key(publisher, plan, interface, slot) {
+            entry.key = key;
+        }
+        let binding = decide(publisher, plan, POLICY, interface, slot)?;
+        entry.object = binding.object;
+        entry.ops = binding.ops;
+        match policy::is_revoked(POLICY_STORE_CPTR, entry.key) {
+            Ok(status::OK) => {}
+            Ok(status::ACCESS) => return Err(Some(reason::REVOKED)),
+            _ => return Err(Some(reason::STORE_UNAVAILABLE)),
+        }
+        if policy::append(POLICY_STORE_CPTR, &AuditEntry { event: event::GRANTING, ..entry }) != Ok(status::OK) {
+            return Err(None);
+        }
+        let dest = GRANT_CPTR_BASE + index;
+        match grant::request_grant(granter(interface), dest, binding.object as usize, binding.ops as usize) {
+            Ok((status::OK, badge)) => {
+                // `decide` refuses a slot that doesn't fit.
+                ledger.record(index, interface, slot as u8, binding, badge, entry.key);
+                Ok(dest)
+            }
+            _ => {
+                let _ = policy::append(POLICY_STORE_CPTR, &AuditEntry { event: event::GRANT_FAILED, ..entry });
+                Err(None)
+            }
+        }
+    };
+    match attempt() {
+        Ok(dest) => Some(dest),
+        Err(declined) => {
+            if let Some(reason) = declined {
+                let _ = policy::append(POLICY_STORE_CPTR, &AuditEntry { reason, ..entry });
+            }
+            None
+        }
     }
 }
 
@@ -107,12 +155,22 @@ fn serve_control(ledger: &mut Ledger, (op, index): (usize, usize)) {
             if recorded {
                 ledger.mark_durable(index);
             }
+            let revoking = AuditEntry {
+                event: event::REVOKING,
+                interface: entry.interface.to_wire() as u8,
+                slot: entry.slot,
+                object: entry.binding.object,
+                ops: entry.binding.ops,
+                key: entry.key,
+                ..AuditEntry::default()
+            };
+            let logged = policy::append(POLICY_STORE_CPTR, &revoking) == Ok(status::OK);
             // The ledger changes only on the service's `OK`; anything else is reported as it is.
             let revoked = grant::request_revoke(granter(entry.interface), entry.badge).unwrap_or(status::FAILED);
             if revoked == status::OK {
                 ledger.mark_revoked(index);
             }
-            let status = if revoked == status::OK && !recorded { status::FAILED } else { revoked };
+            let status = if revoked == status::OK && !(recorded && logged) { status::FAILED } else { revoked };
             [status as usize, 0]
         }
         _ => [status::INVALID as usize, 0],
