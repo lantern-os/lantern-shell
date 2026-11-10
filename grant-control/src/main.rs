@@ -10,8 +10,15 @@
 //! 4. Revokes entry 0, and checks the ledger now says so, and that it is durable.
 //! 5. Revokes it again, which must also succeed.
 //! 6. Checks its read-only audit capability can't append ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)).
-//! 7. Reads the whole audit log and recomputes the chain, which must reach the store's head.
-//! 8. Checks this boot's records: a grant, the runtime's declined self-check, and both revocations.
+//! 7. Reads the whole audit log and recomputes the chain from the oldest surviving header, which must reach
+//!    the store's head.
+//! 8. Checks this boot's binder records: a grant and the badge it got, the runtime's declined self-check,
+//!    and both revocations ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)'s `GRANTED`).
+//! 9. Checks every use the guest's side made of its grant was recorded under that badge, between the grant and
+//!    the revocation, and that each `USE_FAILED` follows its own `USING`. A use of an op outside the grant, such
+//!    as the runtime's own attenuation check, must be followed at once by its `USE_FAILED`: the log then shows
+//!    an attempt to exceed a grant never succeeded.
+//! 10. Checks every other recorded use carries a badge a service's own `SERVICE_GRANTED` named this boot.
 //!
 //! Then it signals back. Any failed check signals `FAILURE` instead, with the step in `detail`.
 //! Step 4 returning at all shows the service served `REVOKE` during the open exchange.
@@ -22,9 +29,9 @@
 
 use lantern_abi::frame::status;
 use lantern_abi::grant;
-use lantern_abi::policy::{self, event, reason, AuditEntry};
+use lantern_abi::policy::{self, event, reason, AuditEntry, Source};
 use lantern_abi::sys;
-use lantern_policy_store::audit::{chain, GENESIS};
+use lantern_policy_store::audit::chain;
 
 /// The binder's endpoint, under `CONTROL_BADGE`.
 const CONTROL_CPTR: usize = 1;
@@ -101,12 +108,13 @@ fn script(interface: u8, ops: u8) -> Result<(), usize> {
     }
 
     let (status, count, head) = policy::head(READER_CPTR).map_err(|_| 7usize)?;
-    if status != status::OK {
+    let (oldest_status, oldest, previous) = policy::oldest(READER_CPTR).map_err(|_| 7usize)?;
+    if status != status::OK || oldest_status != status::OK || oldest > count {
         return Err(7);
     }
-    let mut chained = GENESIS;
+    let mut chained = previous;
     let mut last_boot = None;
-    for index in 0..count {
+    for index in oldest..count {
         let entry = read(index).ok_or(7usize)?;
         chained = chain(chained, &entry, index);
         if entry.event == event::BOOT {
@@ -116,20 +124,27 @@ fn script(interface: u8, ops: u8) -> Result<(), usize> {
     if chained != head {
         return Err(7);
     }
+    let first = last_boot.ok_or(8usize)? + 1;
+    let this_boot = || (first..count).map(|index| read(index).ok_or(8usize));
 
-    // This boot, after its own `BOOT`. Repeated attempts at a bound slot aren't recorded.
-    let expected = [
+    // The binder's records, in order. Repeated attempts at a bound slot aren't recorded.
+    let binder = [
         (event::GRANTING, reason::NONE, interface, ops),
+        (event::GRANTED, reason::NONE, interface, ops),
         (event::DECLINED, reason::NOT_DECLARED, 0, 0),
         (event::REVOKING, reason::NONE, interface, ops),
         (event::REVOKING, reason::NONE, interface, ops),
     ];
-    let first = last_boot.ok_or(8usize)? + 1;
-    if count - first != expected.len() as u64 {
-        return Err(8);
-    }
-    for (offset, &(event, reason, interface, ops)) in expected.iter().enumerate() {
-        let entry = read(first + offset as u64).ok_or(8usize)?;
+    let mut seen = 0;
+    let mut badge = None;
+    // Positions in this boot, for step 9: the `GRANTED` and the first `REVOKING`.
+    let (mut granted_at, mut revoking_at) = (None, None);
+    for (position, entry) in this_boot().enumerate() {
+        let entry = entry?;
+        if !Source::Binder.may_append(entry.event) {
+            continue;
+        }
+        let &(event, reason, interface, ops) = binder.get(seen).ok_or(8usize)?;
         let matches = entry.event == event
             && entry.reason == reason
             && entry.slot == 0
@@ -137,6 +152,64 @@ fn script(interface: u8, ops: u8) -> Result<(), usize> {
         if !matches {
             return Err(8);
         }
+        if event == event::GRANTED {
+            badge = Some(entry.subject[0]);
+            granted_at = Some(position);
+        }
+        if event == event::REVOKING && revoking_at.is_none() {
+            revoking_at = Some(position);
+        }
+        seen += 1;
+    }
+    let (Some(badge), Some(granted_at), Some(revoking_at), true) = (badge, granted_at, revoking_at, seen == binder.len()) else {
+        return Err(8);
+    };
+
+    // Each use: under the granted badge, after the grant and before the revocation, and only the granted ops.
+    // Other services' uses must be under a badge their own `SERVICE_GRANTED` named.
+    let mut uses = 0;
+    let mut service_badges = [(0u8, 0u64); 4];
+    let mut service_grants = 0;
+    let mut previous_use: Option<AuditEntry> = None;
+    for (position, entry) in this_boot().enumerate() {
+        let entry = entry?;
+        match entry.event {
+            event::SERVICE_GRANTED => {
+                *service_badges.get_mut(service_grants).ok_or(10usize)? = (entry.interface, entry.subject[0]);
+                service_grants += 1;
+            }
+            event::USING | event::USE_FAILED if entry.interface == interface => {
+                let in_window = granted_at < position && position < revoking_at;
+                if entry.subject[0] != badge || !in_window {
+                    return Err(9);
+                }
+                let outside_grant = |e: &AuditEntry| e.ops == 0 || e.ops & !ops != 0;
+                let follows_its_using = previous_use.is_some_and(|p| p.event == event::USING && p.subject == entry.subject);
+                let previous_outside = previous_use.is_some_and(|p| p.event == event::USING && outside_grant(&p));
+                if entry.event == event::USING {
+                    if previous_outside {
+                        return Err(9);
+                    }
+                    uses += 1;
+                } else {
+                    let refused = matches!(entry.reason as u16, status::ACCESS | status::INVALID);
+                    if !follows_its_using || previous_outside && !refused {
+                        return Err(9);
+                    }
+                }
+                previous_use = Some(entry);
+            }
+            event::USING | event::USE_FAILED
+                if !service_badges[..service_grants].contains(&(entry.interface, entry.subject[0])) =>
+            {
+                return Err(10);
+            }
+            event::QUOTA_REACHED => return Err(9),
+            _ => {}
+        }
+    }
+    if uses == 0 || previous_use.is_some_and(|p| p.event == event::USING && (p.ops == 0 || p.ops & !ops != 0)) {
+        return Err(9);
     }
     Ok(())
 }

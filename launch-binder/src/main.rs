@@ -16,7 +16,9 @@
 //! The audit log ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)) records every grant, decline and
 //! revocation, with the reason the runtime isn't told. **A grant is recorded before it's attempted**, so an
 //! unrecorded grant can't happen, and a log that can't take the record declines it. A revocation is never
-//! blocked by the log.
+//! blocked by the log. After the service's `OK`, `GRANTED` records the badge it minted, which is how a reader
+//! links each service's records of use ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md))
+//! back to the role.
 
 #![no_std]
 #![no_main]
@@ -100,12 +102,12 @@ fn bind(
         let interface = Interface::from_wire(interface_word).ok_or(reason::NOT_DECLARED)?;
         let (publisher, plan) = package.as_ref().ok_or(reason::UNVERIFIED_PACKAGE)?;
         if let Some(key) = revocation_key(publisher, plan, interface, slot) {
-            entry.key = key;
+            entry.subject = key;
         }
         let binding = decide(publisher, plan, POLICY, interface, slot)?;
         entry.object = binding.object;
         entry.ops = binding.ops;
-        match policy::is_revoked(POLICY_STORE_CPTR, entry.key) {
+        match policy::is_revoked(POLICY_STORE_CPTR, entry.subject) {
             Ok(status::OK) => {}
             Ok(status::ACCESS) => return Err(Some(reason::REVOKED)),
             _ => return Err(Some(reason::STORE_UNAVAILABLE)),
@@ -117,7 +119,11 @@ fn bind(
         match grant::request_grant(granter(interface), dest, binding.object as usize, binding.ops as usize) {
             Ok((status::OK, badge)) => {
                 // `decide` refuses a slot that doesn't fit.
-                ledger.record(index, interface, slot as u8, binding, badge, entry.key);
+                ledger.record(index, interface, slot as u8, binding, badge, entry.subject);
+                // `GRANTING` already covers the grant, so failing to record this loses only the link from the badge
+                // to the role, which then shows as a `GRANTING` with nothing after it.
+                let granted = AuditEntry { event: event::GRANTED, subject: [badge, 0], ..entry };
+                let _ = policy::append(POLICY_STORE_CPTR, &granted);
                 Ok(dest)
             }
             _ => {
@@ -161,7 +167,7 @@ fn serve_control(ledger: &mut Ledger, (op, index): (usize, usize)) {
                 slot: entry.slot,
                 object: entry.binding.object,
                 ops: entry.binding.ops,
-                key: entry.key,
+                subject: entry.key,
                 ..AuditEntry::default()
             };
             let logged = policy::append(POLICY_STORE_CPTR, &revoking) == Ok(status::OK);

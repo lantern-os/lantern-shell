@@ -3,9 +3,15 @@
 //! `lib.rs` for the log, and for why it detects accidents rather than attackers.
 //!
 //! It holds revocations, not grants, so **it can only narrow** what the launch binder's compiled-in
-//! policy allows. Only the binder holds its endpoint, apart from one read-only copy under
-//! `READER_BADGE` for the audit log ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)), which
-//! it also keeps, in the same flash. It holds no other service's endpoint and can mint nothing.
+//! policy allows. The binder holds its endpoint under badge 0. It also keeps the audit log
+//! ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)), in the same flash, which one read-only copy
+//! under `READER_BADGE` reads, and which each service appends to under its own writer badge
+//! ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)). **The badge, which the kernel
+//! sets, decides what a request may do** (`policy::Source`), and a service's records are stamped with its own
+//! interface whatever it sends. It holds no other service's endpoint and can mint nothing.
+//!
+//! `arg0` is the per-grant quota of operation records, if the launcher wants it below `USE_QUOTA`. 0 means
+//! the default.
 //!
 //! The driver below is the Intel command set of QEMU's `virt.flash1`, width 4, so each command goes
 //! to both interleaved 16-bit devices. A real board needs its own driver behind the same protocol.
@@ -15,9 +21,10 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use lantern_abi::frame::status;
+use lantern_abi::policy::{event, AuditEntry, Source};
 use lantern_abi::{policy, sys};
-use lantern_abi::policy::event;
 use lantern_policy_store::audit::AuditLog;
+use lantern_policy_store::quota::{Charge, Quota};
 use lantern_policy_store::{Flash, Log};
 
 const ENDPOINT_CPTR: usize = 1;
@@ -30,9 +37,17 @@ const FLASH_VADDR: usize = 0x9400_0000;
 
 const CMD_READ_ARRAY: u32 = 0x00ff_00ff;
 const CMD_PROGRAM: u32 = 0x0040_0040;
+const CMD_BLOCK_ERASE: u32 = 0x0020_0020;
+const CMD_CONFIRM: u32 = 0x00d0_00d0;
+const CMD_CLEAR_STATUS: u32 = 0x0050_0050;
 const STATUS_READY: u32 = 0x0080_0080;
 /// A QEMU program finishes at once. On timeout, the log's read-back finds out what happened.
 const READY_POLLS: usize = 100_000;
+/// A real sector erase takes on the order of a second. On timeout, the log's read-back finds out.
+const ERASE_POLLS: usize = 100_000_000;
+
+/// Grants tracked for the quota: every grant two services can hold (`lantern-capabilities`' `MAX_GRANTS`).
+const QUOTA_GRANTS: usize = 64;
 
 struct MappedFlash;
 
@@ -64,55 +79,101 @@ impl Flash for MappedFlash {
             core::ptr::write_volatile(address, CMD_READ_ARRAY);
         }
     }
+
+    fn erase_sector(&mut self, first: usize, _words: usize) {
+        let address = Self::word(first);
+        // SAFETY: as `program`. The audit log only erases whole sectors of its own, inside the megapage.
+        unsafe {
+            core::ptr::write_volatile(address, CMD_CLEAR_STATUS);
+            core::ptr::write_volatile(address, CMD_BLOCK_ERASE);
+            core::ptr::write_volatile(address, CMD_CONFIRM);
+            for _ in 0..ERASE_POLLS {
+                if core::ptr::read_volatile(address) & STATUS_READY == STATUS_READY {
+                    break;
+                }
+            }
+            core::ptr::write_volatile(address, CMD_READ_ARRAY);
+        }
+    }
 }
 
 lantern_abi::entry!(run);
 
-fn run(_arg0: usize) -> ! {
+fn run(quota: usize) -> ! {
     lantern_abi::rt::report_panics_via(FAILURE_CPTR);
     let mut log = Log::open(MappedFlash);
     let mut audit = AuditLog::open(MappedFlash);
+    let limit = if quota == 0 { policy::USE_QUOTA } else { (quota as u32).min(policy::USE_QUOTA) };
+    let mut quota = Quota::<QUOTA_GRANTS>::new(limit);
     loop {
         let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
         let request = policy::request(&received);
-        if request.from_reader {
-            let _ = match request.op {
-                policy::OP_HEAD => match audit.head() {
-                    Ok(head) => policy::reply_head(status::OK, head.count, head.head),
-                    Err(_) => policy::reply_head(status::FAILED, 0, [0; 16]),
-                },
-                policy::OP_READ => match audit.read(request.index) {
-                    Ok(Some(entry)) => policy::reply_read(status::OK, &entry),
-                    Ok(None) => policy::reply_read(status::INVALID, &Default::default()),
-                    Err(_) => policy::reply_read(status::FAILED, &Default::default()),
-                },
-                policy::OP_APPEND => policy::reply_append(status::ACCESS),
-                _ => policy::reply(status::ACCESS),
-            };
-            continue;
-        }
-        if request.op == policy::OP_APPEND {
-            // `BOOT` is the store's own record, once per start.
-            let answer = match request.entry.event {
-                event::BOOT => status::INVALID,
-                _ if audit.append(&request.entry).is_ok() => status::OK,
-                _ => status::FAILED,
-            };
-            let _ = policy::reply_append(answer);
-            continue;
-        }
-        let answer = match request.op {
-            policy::OP_IS_REVOKED => match log.is_revoked(request.key) {
-                Ok(false) => status::OK,
-                Ok(true) => status::ACCESS,
-                Err(_) => status::FAILED,
+        let _ = match request.source {
+            Source::Reader => serve_reader(&audit, request.op, request.index),
+            Source::Binder => match request.op {
+                policy::OP_APPEND => policy::reply_append(append(&mut audit, Source::Binder, request.entry)),
+                policy::OP_IS_REVOKED => policy::reply(match log.is_revoked(request.key) {
+                    Ok(false) => status::OK,
+                    Ok(true) => status::ACCESS,
+                    Err(_) => status::FAILED,
+                }),
+                policy::OP_RECORD => policy::reply(match log.record(request.key) {
+                    Ok(()) => status::OK,
+                    Err(_) => status::FAILED,
+                }),
+                _ => policy::reply(status::INVALID),
             },
-            policy::OP_RECORD => match log.record(request.key) {
-                Ok(()) => status::OK,
-                Err(_) => status::FAILED,
-            },
-            _ => status::INVALID,
+            Source::Service(interface) if request.op == policy::OP_APPEND => {
+                let entry = AuditEntry { interface, ..request.entry };
+                let answer = if !Source::Service(interface).may_append(entry.event) {
+                    status::ACCESS
+                } else if matches!(entry.event, event::USING | event::USE_FAILED) {
+                    match quota.charge(interface, entry.subject[0]) {
+                        Charge::Allowed => append(&mut audit, request.source, entry),
+                        Charge::Reached => {
+                            let _ = audit.append(&AuditEntry { event: event::QUOTA_REACHED, slot: entry.event, ..entry });
+                            status::ACCESS
+                        }
+                        Charge::Refused => status::ACCESS,
+                    }
+                } else {
+                    append(&mut audit, request.source, entry)
+                };
+                policy::reply_append(answer)
+            }
+            Source::Service(_) | Source::Unknown => policy::reply_refused(),
         };
-        let _ = policy::reply(answer);
+    }
+}
+
+/// An `APPEND` from `source`: `OK` only once it's on flash. The events a source may not append are refused,
+/// which includes the store's own `BOOT`, `QUOTA_REACHED` and `RETIRED`.
+fn append(audit: &mut AuditLog<MappedFlash>, source: Source, entry: AuditEntry) -> u16 {
+    if !source.may_append(entry.event) {
+        status::ACCESS
+    } else if audit.append(&entry).is_ok() {
+        status::OK
+    } else {
+        status::FAILED
+    }
+}
+
+/// `HEAD`, `OLDEST` and `READ`, and nothing else, for the read-only badge.
+fn serve_reader(audit: &AuditLog<MappedFlash>, op: u32, index: u64) -> Result<(), lantern_abi::wire::SyscallError> {
+    match op {
+        policy::OP_HEAD => match audit.head() {
+            Ok(head) => policy::reply_head(status::OK, head.count, head.head),
+            Err(_) => policy::reply_head(status::FAILED, 0, [0; 16]),
+        },
+        policy::OP_OLDEST => match audit.head() {
+            Ok(head) => policy::reply_oldest(status::OK, head.oldest, head.oldest_previous),
+            Err(_) => policy::reply_oldest(status::FAILED, 0, [0; 16]),
+        },
+        policy::OP_READ => match audit.read(index) {
+            Ok(Some(entry)) => policy::reply_read(status::OK, &entry),
+            Ok(None) => policy::reply_read(status::INVALID, &Default::default()),
+            Err(_) => policy::reply_read(status::FAILED, &Default::default()),
+        },
+        _ => policy::reply_refused(),
     }
 }

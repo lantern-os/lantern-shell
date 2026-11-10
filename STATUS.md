@@ -29,9 +29,16 @@
   that can't take the record declines it. A revocation is never blocked by the log. Declines are recorded with their reason,
   though the runtime still hears only `DECLINED`. `grant-control` reads the log through a read-only capability and recomputes the
   chain in both demos, and `policy-store/examples/audit-dump.rs` prints and verifies a flash image's log. **It records the binder's
-  decisions, not what a guest did with a grant**, so the exit criterion's "faithful audit log" isn't met yet. Without a hardware key,
+  decisions, not what a guest did with a grant** (v1 below records that). Without a hardware key,
   a consistent rewrite of the whole chain verifies; only a kept head reveals it, and `binder-matrix.sh` tests both. 23 store tests,
   20 binder tests.
+- **The audit log v1 (2026-11-10):** [RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)/[ADR-0030](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0030-audit-log-service-operations.md). **Every use of a grant is now recorded, by the service, before it acts.** The
+  store decides what each badge may append and stamps a service's interface; the binder adds `GRANTED`, linking a badge to its
+  role. Each audit sector has its own header, and a full ring retires its oldest sector, recording `RETIRED`; every power cut
+  recovers by a rule read from flash. A per-grant quota of 1,024 records per boot refuses the rest. `OLDEST` tells a reader where
+  to start. `grant-control` checks each demo's uses against its grant, and `audit-dump` joins role, badge and uses, and has
+  `--fill`. With the binder's records, this is what the exit criterion's "faithful audit log" asks for, for the services that
+  exist. 36 store tests, 20 binder tests.
 - Shell-as-consent-broker role and responsibilities drafted and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
 - Threat model drafted and reviewed (consent integrity, trusted path).
 
@@ -48,4 +55,4 @@
 
 ## Blocked on
 - ~~Audit log ([`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime)).~~ v0 is here, in `policy-store` (RFC-0024), until
-  `lantern-ai-runtime` has code. Recording what a guest does with a grant is the next RFC.
+  `lantern-ai-runtime` has code. What a guest does with a grant is recorded too, since RFC-0025.
