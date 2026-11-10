@@ -23,6 +23,8 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod audit;
+
 use lantern_abi::policy::RevocationKey;
 use lantern_crypto::hash;
 
@@ -181,14 +183,14 @@ fn is_record(words: &Slot) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
 
     /// Real flash's one rule: programming can only clear bits. Shared, so a test can reopen it as a reboot.
     #[derive(Clone)]
-    struct FakeFlash {
+    pub(crate) struct FakeFlash {
         words: Rc<RefCell<Vec<u32>>>,
         /// Programs after this many words are lost, as in a power cut.
         budget: Rc<RefCell<usize>>,
@@ -196,18 +198,27 @@ mod tests {
 
     impl FakeFlash {
         fn erased() -> Self {
-            Self { words: Rc::new(RefCell::new(vec![ERASED; LOG_WORDS])), budget: Rc::new(RefCell::new(usize::MAX)) }
+            Self::erased_words(LOG_WORDS)
         }
 
-        fn lose_power_after(&self, words: usize) {
+        pub(crate) fn erased_words(words: usize) -> Self {
+            Self { words: Rc::new(RefCell::new(vec![ERASED; words])), budget: Rc::new(RefCell::new(usize::MAX)) }
+        }
+
+        /// An independent copy, unlike `clone`, which shares the same flash.
+        pub(crate) fn deep_copy(&self) -> Self {
+            Self { words: Rc::new(RefCell::new(self.words.borrow().clone())), budget: Rc::new(RefCell::new(usize::MAX)) }
+        }
+
+        pub(crate) fn lose_power_after(&self, words: usize) {
             *self.budget.borrow_mut() = words;
         }
 
-        fn power_back(&self) {
+        pub(crate) fn power_back(&self) {
             *self.budget.borrow_mut() = usize::MAX;
         }
 
-        fn poke(&self, word: usize, value: u32) {
+        pub(crate) fn poke(&self, word: usize, value: u32) {
             self.words.borrow_mut()[word] = value;
         }
     }

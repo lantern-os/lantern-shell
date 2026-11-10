@@ -1,6 +1,6 @@
 # lantern-shell — Status
 
-**Phase:** 3 (Privacy, identity, networking, and AI) — opened per [RFC-0017](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0017-phase-2-to-phase-3-transition.md)/[ADR-0021](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0021-phase-2-complete-phase-3-opened.md). Three confined programs exist; the consent surface is still design only — see "Blocked on".
+**Phase:** 3 (Privacy, identity, networking, and AI) — opened per [RFC-0017](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0017-phase-2-to-phase-3-transition.md)/[ADR-0021](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0021-phase-2-complete-phase-3-opened.md). Three confined programs exist, and `policy-store` now keeps the audit log too; the consent surface is still design only — see "Blocked on".
 
 ## Done
 - **The launch binder v0 (2026-11-02), this repo's first code:** `launch-binder/`, per
@@ -24,6 +24,14 @@
   corrupt store or missing flash declines everything. **It doesn't resist offline tampering:** erasing the flash restores
   every revoked role, and `binder-matrix.sh` tests that so it stays visible. 13 log tests, including a power cut at
   every word of a record, and 19 binder tests.
+- **The audit log v0 (2026-11-05):** [RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)/[ADR-0029](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0029-audit-log.md). `policy-store` keeps a hash-chained log of every grant, decline and revocation
+  in flash sectors 1 to 7. The binder records a grant **before** attempting it, so an unrecorded grant can't happen, and a log
+  that can't take the record declines it. A revocation is never blocked by the log. Declines are recorded with their reason,
+  though the runtime still hears only `DECLINED`. `grant-control` reads the log through a read-only capability and recomputes the
+  chain in both demos, and `policy-store/examples/audit-dump.rs` prints and verifies a flash image's log. **It records the binder's
+  decisions, not what a guest did with a grant**, so the exit criterion's "faithful audit log" isn't met yet. Without a hardware key,
+  a consistent rewrite of the whole chain verifies; only a kept head reveals it, and `binder-matrix.sh` tests both. 23 store tests,
+  20 binder tests.
 - Shell-as-consent-broker role and responsibilities drafted and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
 - Threat model drafted and reviewed (consent integrity, trusted path).
 
@@ -31,8 +39,13 @@
 - **Replace the binder's compiled-in policy and `grant-control` with real consent**, which needs a trusted-path
   surface. That's what's left of the Phase 3 exit criterion's "visible, revocable capability set": no person sees
   or decides anything yet. The store then has to hold grants too, and can no longer only narrow (RFC-0022).
-- **A hardware root of trust**, so the log resists offline tampering and rollback, and a recovery path for a corrupt store.
+- A recovery path for a corrupt store.
 - Design the consent UX and standard capability shapes (with [`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime) and [`lantern-sdk`](https://github.com/lantern-os/lantern-sdk)).
 
+## Phase 4
+- **A hardware root of trust**, so the log resists offline tampering and rollback, on
+  [RFC-0023](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0023-hardware-key-custody-in-phase-4.md)'s checklist.
+
 ## Blocked on
-- Audit log ([`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime)).
+- ~~Audit log ([`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime)).~~ v0 is here, in `policy-store` (RFC-0024), until
+  `lantern-ai-runtime` has code. Recording what a guest does with a grant is the next RFC.
