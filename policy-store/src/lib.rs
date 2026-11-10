@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod quota;
 
 use lantern_abi::policy::RevocationKey;
 use lantern_crypto::hash;
@@ -32,6 +33,9 @@ use lantern_crypto::hash;
 pub trait Flash {
     fn read(&self, word: usize) -> u32;
     fn program(&mut self, word: usize, value: u32);
+    /// Sets the sector of `words` words starting at `first` back to all ones. Interrupted, it leaves anything.
+    /// Only the audit log's retention erases (RFC-0025), and never sector 0.
+    fn erase_sector(&mut self, first: usize, words: usize);
 }
 
 const ERASED: u32 = u32::MAX;
@@ -232,6 +236,18 @@ pub(crate) mod tests {
             if *budget > 0 {
                 *budget -= 1;
                 self.words.borrow_mut()[word] &= value;
+            }
+        }
+        /// Each word erased costs one unit of the power budget, so a cut leaves the sector part erased and
+        /// part old, which reads as neither.
+        fn erase_sector(&mut self, first: usize, words: usize) {
+            let mut budget = self.budget.borrow_mut();
+            for word in first..first + words {
+                if *budget == 0 {
+                    return;
+                }
+                *budget -= 1;
+                self.words.borrow_mut()[word] = u32::MAX;
             }
         }
     }
