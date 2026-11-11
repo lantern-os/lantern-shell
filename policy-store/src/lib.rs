@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod decisions;
 pub mod quota;
 
 use lantern_abi::policy::RevocationKey;

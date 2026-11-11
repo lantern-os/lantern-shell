@@ -1,0 +1,31 @@
+[package]
+name = "lantern-shell"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0026's shell: the only confined program that reaches the console. It shows each grant request a person decides, lists and revokes grants, and reads the audit log, at a serial console no other program can write to. Loaded by lantern-boot's system image."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_shell"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-shell"
+path = "src/main.rs"
+# Bare-metal riscv64 only: there is no `test` crate for this target.
+test = false
+
+[dependencies]
+# Its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+# The audit log's chain, to verify it before showing it.
+lantern-policy-store = { path = "../policy-store" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# `lantern-boot` embeds this ELF in its own kernel image (`lantern-boot/linker.ld`).
+strip = true

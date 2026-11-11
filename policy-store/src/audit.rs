@@ -1,7 +1,7 @@
 //! The audit log: a hash-chained, append-only record of the launch binder's decisions
 //! ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)) and of every use of a grant
-//! ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)), in sectors 1 to 7 of the same
-//! flash as the revocation log.
+//! ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)), in sectors 2 to 7 of the same
+//! flash as the revocation log, beside the remembered decisions in sector 1.
 //!
 //! **Each sector is its own run of slots**, starting with a header: the sequence number of its first record and
 //! the chain head before it. Slots follow the revocation log's rules (`lib.rs`): erased, a record, a tombstone,
@@ -28,13 +28,15 @@ use crate::Flash;
 const ERASED: u32 = u32::MAX;
 const SLOT_WORDS: usize = 16;
 const SECTOR_WORDS: usize = 0x4_0000 / 4;
-/// Sectors 1 to 7 of the mapped megapage. Sector 0 is the revocation log's, and retention never touches it.
-pub const FIRST_SECTOR: usize = 1;
+/// Sectors 2 to 7 of the mapped megapage. Sector 0 is the revocation log's and sector 1 the remembered decisions'
+/// ([RFC-0026](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0026-trusted-path-and-consent.md)), and retention never touches either.
+pub const FIRST_SECTOR: usize = 2;
 pub const LAST_SECTOR: usize = 7;
 /// Records per sector: the header takes the first slot.
 pub const SECTOR_SLOTS: usize = SECTOR_WORDS / SLOT_WORDS - 1;
-/// `b"LNTNAUD2"`, then the format version. Format 1 (RFC-0024's single header) reads as corrupt.
-const MAGIC: [u32; 3] = [0x4e54_4e4c, 0x3244_5541, 2];
+/// `b"LNTNAUD3"`, then the format version. Format 3 starts at sector 2; earlier formats, which started at sector 1,
+/// read as corrupt, rather than half-parsing.
+const MAGIC: [u32; 3] = [0x4e54_4e4c, 0x3344_5541, 3];
 
 type Slot = [u32; SLOT_WORDS];
 
@@ -653,13 +655,15 @@ mod tests {
     }
 
     #[test]
-    fn a_format_1_log_is_corrupt() {
-        let flash = flash();
-        let v1 = [0x4e54_4e4c, 0x3144_5541, 1];
-        for (i, word) in v1.into_iter().chain([0; 13]).enumerate() {
-            flash.poke(sector_word(FIRST_SECTOR) + i, word);
+    fn an_earlier_format_is_corrupt_not_half_read() {
+        // Format 1's single header, and format 2's sector header, which started the ring at sector 1.
+        for old in [[0x4e54_4e4c, 0x3144_5541, 1], [0x4e54_4e4c, 0x3244_5541, 2]] {
+            let flash = flash();
+            for (i, word) in old.into_iter().chain([0; 13]).enumerate() {
+                flash.poke(sector_word(FIRST_SECTOR) + i, word);
+            }
+            assert_eq!(AuditLog::open(flash).head(), Err(Corrupt), "{old:x?}");
         }
-        assert_eq!(AuditLog::open(flash).head(), Err(Corrupt));
     }
 
     #[test]
