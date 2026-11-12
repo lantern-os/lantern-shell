@@ -194,6 +194,62 @@ fn op_bit(interface: Interface, op: &str) -> Option<u8> {
     }
 }
 
+// --- Consent ([RFC-0026](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0026-trusted-path-and-consent.md)). `POLICY` is a ceiling: a request
+// outside it is declined without a prompt, and one inside it is a person's to decide, unless they already decided.
+
+/// What a remembered decision says about a request for `requested_ops`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Remembered {
+    Allow,
+    Deny,
+    /// Nothing remembered, or an "always" that doesn't cover every op asked for now: the person is asked.
+    Ask,
+}
+
+/// An "always" covers a request only if it allowed every op being requested now. So an app that later declares more ops
+/// is asked again.
+pub fn remembered(decision: u8, remembered_ops: u8, requested_ops: u8) -> Remembered {
+    match decision {
+        lantern_abi::policy::decision::DENY => Remembered::Deny,
+        lantern_abi::policy::decision::ALLOW if requested_ops & !remembered_ops == 0 => Remembered::Allow,
+        _ => Remembered::Ask,
+    }
+}
+
+/// What an answer means: `Ok` with `CONSENTED`'s reason, or `Err` with the decline reason, and whether to remember it.
+/// No answer, or anything but one known answer, is a refusal.
+pub fn outcome(answer: Option<lantern_abi::consent::Answer>) -> (Result<u8, u8>, Option<u8>) {
+    use lantern_abi::consent::Answer;
+    use lantern_abi::policy::{consent_reason, decision};
+    match answer {
+        Some(Answer::AllowOnce) => (Ok(consent_reason::ONCE), None),
+        Some(Answer::AllowAlways) => (Ok(consent_reason::ALWAYS), Some(decision::ALLOW)),
+        Some(Answer::Deny) => (Err(reason::PERSON_DENIED), None),
+        Some(Answer::DenyAlways) => (Err(reason::PERSON_DENIED), Some(decision::DENY)),
+        None => (Err(reason::NO_CONSENT), None),
+    }
+}
+
+/// The request at `(interface, slot)` in `plan`: its role, ops and justification.
+pub fn request(plan: &GrantPlan, interface: Interface, slot: usize) -> Option<&ResourceRequest> {
+    match interface {
+        Interface::Keystore => plan.keystore.get(slot),
+        Interface::Filesystem => plan.filesystem.get(slot),
+    }
+}
+
+/// Which of `plan`'s requests a revocation key names, if any: for naming a remembered decision on the console.
+pub fn role_for_key<'a>(publisher: &PublisherKey, plan: &'a GrantPlan, key: RevocationKey) -> Option<&'a ResourceRequest> {
+    [Interface::Keystore, Interface::Filesystem].into_iter().find_map(|interface| {
+        let requests = match interface {
+            Interface::Keystore => &plan.keystore,
+            Interface::Filesystem => &plan.filesystem,
+        };
+        requests.iter().find(|r| key_for(publisher, &plan.app.name, interface, &r.role) == key)
+    })
+}
+
+
 /// How many grants one launch can hold: each takes one of the binder's capability slots.
 pub const MAX_BINDS: usize = 4;
 
@@ -303,6 +359,41 @@ mod tests {
     fn decide_keystore(seed: u8, manifest: &str) -> Option<Binding> {
         let (publisher, plan) = read_package(&lpkg(seed, manifest), TRUSTED_PUBLISHERS)?;
         decide(&publisher, &plan, POLICY, Interface::Keystore, 0).ok()
+    }
+
+    #[test]
+    fn an_always_covers_only_the_ops_it_allowed_and_a_never_always_denies() {
+        use lantern_abi::policy::decision;
+        let sign = KeyOps::SIGN.bits();
+        let sign_encrypt = sign | KeyOps::ENCRYPT.bits();
+        assert_eq!(remembered(decision::NONE, 0, sign), Remembered::Ask);
+        assert_eq!(remembered(decision::ALLOW, sign, sign), Remembered::Allow);
+        assert_eq!(remembered(decision::ALLOW, sign_encrypt, sign), Remembered::Allow, "fewer ops than allowed");
+        assert_eq!(remembered(decision::ALLOW, sign, sign_encrypt), Remembered::Ask, "more ops than allowed: ask");
+        assert_eq!(remembered(decision::DENY, sign, sign), Remembered::Deny);
+        assert_eq!(remembered(7, sign, sign), Remembered::Ask, "an unknown decision settles nothing");
+    }
+
+    #[test]
+    fn each_answer_maps_to_its_record_and_what_to_remember() {
+        use lantern_abi::consent::Answer;
+        use lantern_abi::policy::{consent_reason, decision};
+        assert_eq!(outcome(Some(Answer::AllowOnce)), (Ok(consent_reason::ONCE), None));
+        assert_eq!(outcome(Some(Answer::AllowAlways)), (Ok(consent_reason::ALWAYS), Some(decision::ALLOW)));
+        assert_eq!(outcome(Some(Answer::Deny)), (Err(reason::PERSON_DENIED), None));
+        assert_eq!(outcome(Some(Answer::DenyAlways)), (Err(reason::PERSON_DENIED), Some(decision::DENY)));
+        assert_eq!(outcome(None), (Err(reason::NO_CONSENT), None));
+    }
+
+    #[test]
+    fn a_key_names_its_role_and_no_other() {
+        let m = manifest("confined-probe", "keystore.key", "probe-signing", "\"sign\"");
+        let (publisher, plan) = read_package(&lpkg(0x4c, &m), TRUSTED_PUBLISHERS).unwrap();
+        let key = revocation_key(&publisher, &plan, Interface::Keystore, 0).unwrap();
+        assert_eq!(role_for_key(&publisher, &plan, key).map(|r| r.role.as_str()), Some("probe-signing"));
+        assert_eq!(role_for_key(&publisher, &plan, [key[0] ^ 1, key[1]]), None);
+        assert_eq!(request(&plan, Interface::Keystore, 0).map(|r| r.justification.as_str()), Some("x"));
+        assert!(request(&plan, Interface::Filesystem, 0).is_none());
     }
 
     #[test]

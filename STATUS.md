@@ -42,10 +42,19 @@
 - Shell-as-consent-broker role and responsibilities drafted and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
 - Threat model drafted and reviewed (consent integrity, trusted path).
 
+- **The shell, and consent (2026-11-11, [RFC-0026](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0026-trusted-path-and-consent.md)/[ADR-0032](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0032-trusted-path-and-consent.md)).** `shell/` is the only program that reaches the console: it alone maps the
+  UART and holds its `IrqHandler`. It shows each request a person decides, sanitizing every byte an app supplied, and
+  answers yes once, always, no or never. It lists grants (`grants`), revokes them (`revoke N`), shows the audit log after
+  verifying its chain (`audit`), and lists and forgets remembered answers (`decisions`, `forget N`). It waits on one
+  notification, whose badge bits are its inputs, so no kernel change was needed. The binder, launched `WITH_CONSENT`, treats
+  its policy as a ceiling and asks within it, recording `CONSENTED` or the person's decline first. A console revoke forgets
+  "always" so the next boot asks again; "never" is permanent until `forget`. `policy-store` keeps remembered decisions in
+  sector 1 (`decisions.rs`), and the audit ring moves to sectors 2 to 7, format 3. 7 shell tests, 23 binder tests, 42 store
+  tests. `lantern-boot`'s `console-matrix.sh` drives it under QEMU, 14 cases. No login: whoever is at the console decides.
 ## Next
-- **Replace the binder's compiled-in policy and `grant-control` with real consent**, which needs a trusted-path
-  surface. That's what's left of the Phase 3 exit criterion's "visible, revocable capability set": no person sees
-  or decides anything yet. The store then has to hold grants too, and can no longer only narrow (RFC-0022).
+- Prompt timeouts, once the kernel has user-space timeouts; and scoped, time-bounded grants with standard capability
+  shapes, so prompts say what they mean (SH2).
+- A user-space launcher, so a person can choose which app runs (the roadmap's installable-system track, step 3).
 - A recovery path for a corrupt store.
 - Design the consent UX and standard capability shapes (with [`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime) and [`lantern-sdk`](https://github.com/lantern-os/lantern-sdk)).
 

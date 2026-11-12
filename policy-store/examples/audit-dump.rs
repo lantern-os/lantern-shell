@@ -3,7 +3,8 @@
 //! Reads the audit log ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md),
 //! [RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)) from a `virt.flash1` image
 //! without changing it: one line per surviving record, then `chain ok`, or `CORRUPT`, which the store itself
-//! would treat the same way. `oldest` says how much history retention has retired.
+//! would treat the same way. `oldest` says how much history retention has retired, and each `decision` line is a
+//! remembered "always" or "never" ([RFC-0026](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0026-trusted-path-and-consent.md)).
 //!
 //! Then, for each grant, one `grant` line joining the role (`GRANTING`), the badge (`GRANTED` or
 //! `SERVICE_GRANTED`) and every use recorded under that badge in the same boot.
@@ -21,8 +22,9 @@
 use std::cell::RefCell;
 
 use lantern_abi::frame::status;
-use lantern_abi::policy::{event, reason, AuditEntry};
+use lantern_abi::policy::{consent_reason, decision, event, reason, AuditEntry};
 use lantern_policy_store::audit::{scan, verify_prefix, AuditLog, Kept};
+use lantern_policy_store::decisions::Decisions;
 use lantern_policy_store::Flash;
 
 /// The first megapage of the image: what the store maps.
@@ -70,6 +72,7 @@ fn name(event: u8) -> &'static str {
         event::USE_FAILED => "USE_FAILED",
         event::QUOTA_REACHED => "QUOTA_REACHED",
         event::RETIRED => "RETIRED",
+        event::CONSENTED => "CONSENTED",
         _ => "UNKNOWN",
     }
 }
@@ -77,6 +80,14 @@ fn name(event: u8) -> &'static str {
 /// A decline's reason, or for `USE_FAILED`, and a `QUOTA_REACHED` that replaced one, the operation's RFC-0019
 /// status.
 fn reason_name(entry: &AuditEntry) -> &'static str {
+    if entry.event == event::CONSENTED {
+        return match entry.reason {
+            consent_reason::ONCE => "ONCE",
+            consent_reason::ALWAYS => "ALWAYS",
+            consent_reason::REMEMBERED => "REMEMBERED",
+            _ => "UNKNOWN",
+        };
+    }
     if entry.event == event::USE_FAILED || entry.event == event::QUOTA_REACHED && entry.slot == event::USE_FAILED {
         return match entry.reason as u16 {
             status::ACCESS => "ACCESS",
@@ -94,6 +105,9 @@ fn reason_name(entry: &AuditEntry) -> &'static str {
         reason::OPS_EXCEED_POLICY => "OPS_EXCEED_POLICY",
         reason::REVOKED => "REVOKED",
         reason::STORE_UNAVAILABLE => "STORE_UNAVAILABLE",
+        reason::PERSON_DENIED => "PERSON_DENIED",
+        reason::REMEMBERED_DENIAL => "REMEMBERED_DENIAL",
+        reason::NO_CONSENT => "NO_CONSENT",
         _ => "UNKNOWN",
     }
 }
@@ -168,6 +182,24 @@ fn main() {
     let head = scanned.head;
     println!("chain ok count={} head={}", head.count, hex(&head.head));
     println!("oldest {} previous={}", head.oldest, hex(&head.oldest_previous));
+    // RFC-0026's remembered decisions, from sector 1. Reading changes nothing: the image is only saved by the options below.
+    let remembered = Decisions::open(&image);
+    for index in 0.. {
+        match remembered.read(index) {
+            Ok(Some(r)) => println!(
+                "decision {} ops={:#x} key={:016x}{:016x}",
+                if r.decision == decision::ALLOW { "ALLOW" } else { "DENY" },
+                r.ops,
+                r.key[0],
+                r.key[1]
+            ),
+            Ok(None) => break,
+            Err(_) => {
+                println!("decisions CORRUPT");
+                break;
+            }
+        }
+    }
     for grant in &grants {
         let role = grant.role.map_or(String::from("service"), |r| format!("{:016x}{:016x}", r[0], r[1]));
         println!(
@@ -202,7 +234,8 @@ fn main() {
             assert_eq!(head.oldest, 0, "forging is only for a log with nothing retired");
             let drop: usize = args[3].parse().expect("INDEX");
             let mut forged = bytes.clone();
-            forged[0x4_0000..MAPPED_BYTES].fill(0xff);
+            // The audit ring's sectors, 2 to 7: the revocations and remembered decisions stay as they were.
+            forged[0x8_0000..MAPPED_BYTES].fill(0xff);
             let blank = words(&forged);
             // Opening writes a header and a `BOOT`, as the original's first record was.
             let mut log = AuditLog::open(&blank);

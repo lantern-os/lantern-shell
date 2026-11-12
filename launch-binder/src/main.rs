@@ -19,6 +19,13 @@
 //! blocked by the log. After the service's `OK`, `GRANTED` records the badge it minted, which is how a reader
 //! links each service's records of use ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md))
 //! back to the role.
+//!
+//! **With consent** ([RFC-0026](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0026-trusted-path-and-consent.md), the `WITH_CONSENT` flag),
+//! [`POLICY`] is a ceiling, and a person decides each request within it, at a console only the shell reaches. A
+//! remembered "always" or "never" settles a request without a prompt; otherwise the binder writes the request into the
+//! consent `Frame`, signals the shell, and waits for the answer, serving nothing else meanwhile. `CONSENTED`, or a decline
+//! with the person's reason, is recorded before anything else happens. A revoke from the console ends the grant and
+//! forgets any "always", so the person is asked again next time; "never" is how a person says no for good.
 
 #![no_std]
 #![no_main]
@@ -26,12 +33,14 @@
 
 extern crate alloc;
 
+use lantern_abi::consent::{self, Answer, Ask};
 use lantern_abi::frame::status;
-use lantern_abi::grant::{self, CONTROL_BADGE, CONTROL_LIST, CONTROL_REVOKE};
-use lantern_abi::policy::{event, reason, AuditEntry};
+use lantern_abi::grant::{self, ListedDecision, CONTROL_BADGE, CONTROL_DECISIONS, CONTROL_FORGET, CONTROL_LIST, CONTROL_REVOKE};
+use lantern_abi::policy::{decision, event, reason, AuditEntry};
 use lantern_abi::{policy, sys};
 use lantern_launch_binder::{
-    decide, read_package, revocation_key, BoundSlots, Interface, Ledger, PublisherKey, MAX_BINDS, POLICY, TRUSTED_PUBLISHERS,
+    decide, outcome, read_package, remembered, request, revocation_key, role_for_key, BoundSlots, Interface, Ledger,
+    PublisherKey, Remembered, MAX_BINDS, POLICY, TRUSTED_PUBLISHERS,
 };
 use lantern_sdk::GrantPlan;
 
@@ -44,6 +53,12 @@ const STORE_GRANTER_CPTR: usize = 3;
 const GRANT_CPTR_BASE: usize = 4;
 /// The policy store's endpoint. Only this program holds one.
 const POLICY_STORE_CPTR: usize = GRANT_CPTR_BASE + MAX_BINDS;
+/// RFC-0026, with consent only: the shell's notification, badged `consent::bit::ASK`, and this program's own answer
+/// notification, which only the shell can signal.
+const SHELL_ASK_CPTR: usize = POLICY_STORE_CPTR + 1;
+const ANSWER_CPTR: usize = POLICY_STORE_CPTR + 2;
+/// Where the loader maps the consent `Frame`, shared with the shell. Must equal `launch::BINDER_CONSENT_VADDR`.
+const CONSENT_VADDR: usize = 0x9000_0000;
 
 /// Must equal `lantern_boot::launch::HEAP_VADDR`, sized by the loader's `heap_megapages`.
 const HEAP_BASE: usize = 0x8620_0000;
@@ -54,7 +69,28 @@ const PACKAGE_MAX_LEN: usize = 0x20_0000;
 
 lantern_abi::entry!(run);
 
-fn run(package_len: usize) -> ! {
+/// Text for the shell, written into the consent `Frame`.
+struct ConsentFrame;
+
+impl ConsentFrame {
+    fn half(offset: usize, len: usize) -> &'static mut [u8] {
+        // SAFETY: with consent, the loader mapped the 4 KiB consent `Frame` read/write at CONSENT_VADDR for this program's
+        // whole life. The two halves don't overlap, and only one is borrowed at a time, briefly, in this single thread.
+        unsafe { core::slice::from_raw_parts_mut((CONSENT_VADDR + offset) as *mut u8, len) }
+    }
+
+    fn ask(ask: &Ask<'_>) {
+        consent::encode_ask(ask, Self::half(consent::ASK_OFFSET, consent::ASK_LEN));
+    }
+
+    fn names(app: &[u8], role: &[u8]) {
+        consent::encode_names(app, role, Self::half(consent::NAMES_OFFSET, consent::NAMES_LEN));
+    }
+}
+
+fn run(arg0: usize) -> ! {
+    let with_consent = arg0 & grant::WITH_CONSENT != 0;
+    let package_len = arg0 & (grant::WITH_CONSENT - 1);
     // SAFETY: the loader mapped `HEAP_BASE..+HEAP_LEN` read/write into this program's own
     // VSpace before its first instruction ran (`ProgramSpec::heap_megapages`).
     unsafe { lantern_abi::rt::init_heap(HEAP_BASE, HEAP_LEN) };
@@ -73,12 +109,13 @@ fn run(package_len: usize) -> ! {
     loop {
         let Ok(received) = sys::recv(BINDER_ENDPOINT_CPTR) else { continue };
         if received.badge == CONTROL_BADGE {
-            serve_control(&mut ledger, grant::control_request(&received));
+            serve_control(&package, with_consent, &mut ledger, grant::control_request(&received));
             continue;
         }
         let (interface, slot) = grant::bind_request(&received);
         // Only a slot's first attempt is decided, or recorded: a caller can't fill the log by repeating one.
-        let granted = bound.claim(interface, slot).and_then(|index| bind(&package, &mut ledger, index, interface, slot));
+        let granted =
+            bound.claim(interface, slot).and_then(|index| bind(&package, with_consent, &mut ledger, index, interface, slot));
         let _ = match granted {
             Some(dest) => grant::reply_granted(dest),
             None => grant::reply_declined(),
@@ -90,6 +127,7 @@ fn run(package_len: usize) -> ! {
 /// recorded except one the log itself refused.
 fn bind(
     package: &Option<(PublisherKey, GrantPlan)>,
+    with_consent: bool,
     ledger: &mut Ledger,
     index: usize,
     interface_word: usize,
@@ -111,6 +149,13 @@ fn bind(
             Ok(status::OK) => {}
             Ok(status::ACCESS) => return Err(Some(reason::REVOKED)),
             _ => return Err(Some(reason::STORE_UNAVAILABLE)),
+        }
+        if with_consent {
+            let consented = consent_for(publisher, plan, interface, slot, entry.subject, binding.ops)?;
+            let record = AuditEntry { event: event::CONSENTED, reason: consented, ..entry };
+            if policy::append(POLICY_STORE_CPTR, &record) != Ok(status::OK) {
+                return Err(None);
+            }
         }
         if policy::append(POLICY_STORE_CPTR, &AuditEntry { event: event::GRANTING, ..entry }) != Ok(status::OK) {
             return Err(None);
@@ -143,6 +188,51 @@ fn bind(
     }
 }
 
+/// RFC-0026: a person's decision on a request already inside the ceiling. `Ok` with `CONSENTED`'s reason, or `Err` with
+/// the decline's. A remembered decision settles it without a prompt; an unreadable one declines, since a remembered
+/// "never" may be what's unreadable.
+fn consent_for(
+    publisher: &PublisherKey,
+    plan: &GrantPlan,
+    interface: Interface,
+    slot: usize,
+    key: policy::RevocationKey,
+    ops: u8,
+) -> Result<u8, Option<u8>> {
+    let (stored, remembered_decision, remembered_ops) =
+        policy::decision_get(POLICY_STORE_CPTR, key).map_err(|_| Some(reason::STORE_UNAVAILABLE))?;
+    if stored != status::OK {
+        return Err(Some(reason::STORE_UNAVAILABLE));
+    }
+    match remembered(remembered_decision, remembered_ops, ops) {
+        Remembered::Allow => return Ok(policy::consent_reason::REMEMBERED),
+        Remembered::Deny => return Err(Some(reason::REMEMBERED_DENIAL)),
+        Remembered::Ask => {}
+    }
+    let request = request(plan, interface, slot).ok_or(Some(reason::NOT_DECLARED))?;
+    ConsentFrame::ask(&Ask {
+        interface: interface.to_wire() as u8,
+        ops,
+        publisher: *publisher,
+        app: plan.app.name.as_bytes(),
+        role: request.role.as_bytes(),
+        justification: request.justification.as_bytes(),
+        truncated: false,
+    });
+    // The shell can't be reached: nobody was asked, so nobody consented.
+    let answer = sys::signal(SHELL_ASK_CPTR).ok().and_then(|()| sys::wait(ANSWER_CPTR).ok()).and_then(Answer::from_badge);
+    let (decided, remember) = outcome(answer);
+    if let Some(remember) = remember {
+        // A failure to remember doesn't change this answer; it only means the person is asked again next time. An
+        // "always" not remembered is recorded as once.
+        let stored = policy::decision_set(POLICY_STORE_CPTR, key, remember, ops) == Ok(status::OK);
+        if !stored && remember == decision::ALLOW {
+            return Ok(policy::consent_reason::ONCE);
+        }
+    }
+    decided.map_err(Some)
+}
+
 fn granter(interface: Interface) -> usize {
     match interface {
         Interface::Keystore => KEYSTORE_GRANTER_CPTR,
@@ -150,14 +240,41 @@ fn granter(interface: Interface) -> usize {
     }
 }
 
-fn serve_control(ledger: &mut Ledger, (op, index): (usize, usize)) {
+fn serve_control(
+    package: &Option<(PublisherKey, GrantPlan)>,
+    with_consent: bool,
+    ledger: &mut Ledger,
+    (op, index): (usize, usize),
+) {
     let entry = ledger.get(index).copied();
     let words = match (op, entry) {
-        (CONTROL_LIST, Some(entry)) => entry.listed().to_words(),
+        (CONTROL_LIST, Some(entry)) => {
+            if let (true, Some((_, plan))) = (with_consent, package) {
+                let role = request(plan, entry.interface, entry.slot as usize).map_or(&b""[..], |r| r.role.as_bytes());
+                ConsentFrame::names(plan.app.name.as_bytes(), role);
+            }
+            entry.listed().to_words()
+        }
+        (CONTROL_DECISIONS, _) if with_consent => list_decision(package, index),
+        (CONTROL_FORGET, _) if with_consent => {
+            let forgot = match policy::decision_read(POLICY_STORE_CPTR, index) {
+                Ok((status::OK, _, _, key)) => {
+                    policy::decision_set(POLICY_STORE_CPTR, key, decision::NONE, 0).unwrap_or(status::FAILED)
+                }
+                Ok((status::INVALID, ..)) => status::INVALID,
+                _ => status::FAILED,
+            };
+            [forgot as usize, 0]
+        }
         (CONTROL_REVOKE, Some(entry)) => {
             // Recorded first, so a crash from here on means declined next boot, the safe direction.
             // A failure to record doesn't stop the revocation: the holder asked for it to end now.
-            let recorded = policy::record(POLICY_STORE_CPTR, entry.key) == Ok(status::OK);
+            // With consent, what's recorded is that any "always" is forgotten: the person is asked again next time.
+            let recorded = if with_consent {
+                policy::decision_set(POLICY_STORE_CPTR, entry.key, decision::NONE, 0) == Ok(status::OK)
+            } else {
+                policy::record(POLICY_STORE_CPTR, entry.key) == Ok(status::OK)
+            };
             if recorded {
                 ledger.mark_durable(index);
             }
@@ -184,4 +301,22 @@ fn serve_control(ledger: &mut Ledger, (op, index): (usize, usize)) {
     let _ = sys::reply([0, words[0], words[1]]);
 }
 
-const _: () = assert!(POLICY_STORE_CPTR < 32);
+/// `DECISIONS`: the `index`th remembered decision, with its names written to the consent `Frame` if it's one of this
+/// package's roles.
+fn list_decision(package: &Option<(PublisherKey, GrantPlan)>, index: usize) -> [usize; 2] {
+    match policy::decision_read(POLICY_STORE_CPTR, index) {
+        Ok((status::OK, decision, ops, key)) => {
+            let role = package.as_ref().and_then(|(publisher, plan)| Some((plan, role_for_key(publisher, plan, key)?)));
+            match role {
+                Some((plan, role)) => ConsentFrame::names(plan.app.name.as_bytes(), role.role.as_bytes()),
+                None => ConsentFrame::names(b"", b""),
+            }
+            let words = ListedDecision { decision, ops, named: role.is_some() }.to_words();
+            [words[0] | status::OK as usize, words[1]]
+        }
+        Ok((status::INVALID, ..)) => [status::INVALID as usize, 0],
+        _ => [status::FAILED as usize, 0],
+    }
+}
+
+const _: () = assert!(ANSWER_CPTR < 32);

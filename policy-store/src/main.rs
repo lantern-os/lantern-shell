@@ -2,8 +2,9 @@
 //! persistent policy store: a confined service, and the only program with the flash mapped. See
 //! `lib.rs` for the log, and for why it detects accidents rather than attackers.
 //!
-//! It holds revocations, not grants, so **it can only narrow** what the launch binder's compiled-in
-//! policy allows. The binder holds its endpoint under badge 0. It also keeps the audit log
+//! It holds revocations, and since [RFC-0026](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0026-trusted-path-and-consent.md) a person's
+//! remembered "always" and "never", in sector 1. An "always" only skips a prompt: it can't widen past the launch binder's
+//! compiled-in policy, which is now a ceiling. The binder holds its endpoint under badge 0. It also keeps the audit log
 //! ([RFC-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0024-audit-log.md)), in the same flash, which one read-only copy
 //! under `READER_BADGE` reads, and which each service appends to under its own writer badge
 //! ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)). **The badge, which the kernel
@@ -24,6 +25,7 @@ use lantern_abi::frame::status;
 use lantern_abi::policy::{event, AuditEntry, Source};
 use lantern_abi::{policy, sys};
 use lantern_policy_store::audit::AuditLog;
+use lantern_policy_store::decisions::Decisions;
 use lantern_policy_store::quota::{Charge, Quota};
 use lantern_policy_store::{Flash, Log};
 
@@ -103,6 +105,7 @@ fn run(quota: usize) -> ! {
     lantern_abi::rt::report_panics_via(FAILURE_CPTR);
     let mut log = Log::open(MappedFlash);
     let mut audit = AuditLog::open(MappedFlash);
+    let mut decisions = Decisions::open(MappedFlash);
     let limit = if quota == 0 { policy::USE_QUOTA } else { (quota as u32).min(policy::USE_QUOTA) };
     let mut quota = Quota::<QUOTA_GRANTS>::new(limit);
     loop {
@@ -121,6 +124,23 @@ fn run(quota: usize) -> ! {
                     Ok(()) => status::OK,
                     Err(_) => status::FAILED,
                 }),
+                // RFC-0026's remembered decisions: the binder's alone, like the revocation log.
+                policy::OP_DECISION_GET => match decisions.get(request.key) {
+                    Ok((decision, ops)) => policy::reply_decision(status::OK, decision, ops, request.key),
+                    Err(_) => policy::reply_decision(status::FAILED, 0, 0, [0, 0]),
+                },
+                policy::OP_DECISION_SET => {
+                    let (decision, ops) = (request.word as u8, (request.word >> 8) as u8);
+                    policy::reply_append(match decisions.set(request.key, decision, ops) {
+                        Ok(()) => status::OK,
+                        Err(_) => status::FAILED,
+                    })
+                }
+                policy::OP_DECISION_READ => match decisions.read(request.word) {
+                    Ok(Some(r)) => policy::reply_decision(status::OK, r.decision, r.ops, r.key),
+                    Ok(None) => policy::reply_decision(status::INVALID, 0, 0, [0, 0]),
+                    Err(_) => policy::reply_decision(status::FAILED, 0, 0, [0, 0]),
+                },
                 _ => policy::reply(status::INVALID),
             },
             Source::Service(interface) if request.op == policy::OP_APPEND => {
