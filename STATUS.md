@@ -51,9 +51,13 @@
   "always" so the next boot asks again; "never" is permanent until `forget`. `policy-store` keeps remembered decisions in
   sector 1 (`decisions.rs`), and the audit ring moves to sectors 2 to 7, format 3. 7 shell tests, 23 binder tests, 42 store
   tests. `lantern-boot`'s `console-matrix.sh` drives it under QEMU, 14 cases. No login: whoever is at the console decides.
+- **Consent has a limit (2026-11-12, [RFC-0028](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0028-deadlines-and-a-capability-clock.md)/[ADR-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0033-deadlines-and-a-capability-clock.md)).** The binder arms its own `Deadline` for each request: nobody answering within 60
+  seconds is `NO_CONSENT`, so a person who walked away, or a shell that hung, can't hold grants forever. The binder confirms
+  each outcome to the shell, which says what was decided only then, and reports a late answer as too late. The shell holds
+  no clock.
 ## Next
-- Prompt timeouts, once the kernel has user-space timeouts; and scoped, time-bounded grants with standard capability
-  shapes, so prompts say what they mean (SH2).
+- A person-set consent limit and a visible countdown; and scoped, time-bounded grants with standard capability shapes, so
+  prompts say what they mean (SH2).
 - A user-space launcher, so a person can choose which app runs (the roadmap's installable-system track, step 3).
 - A recovery path for a corrupt store.
 - Design the consent UX and standard capability shapes (with [`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime) and [`lantern-sdk`](https://github.com/lantern-os/lantern-sdk)).
