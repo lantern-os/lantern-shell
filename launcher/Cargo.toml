@@ -1,0 +1,36 @@
+[package]
+name = "lantern-launcher"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0029's launcher: a confined riscv64 program that builds an app's process from a signed package, through system calls alone, when a person asks at the console, and reclaims it when it ends. Loaded by lantern-boot's system image."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_launcher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-launcher"
+path = "src/main.rs"
+# Bare-metal riscv64 only: there is no `test` crate for this target.
+test = false
+
+[dependencies]
+# Each its own `lantern-os` repo.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+# Its package verification and trusted publishers: the launcher verifies with the binder's own code, and the binder
+# verifies again for itself.
+lantern-launch-binder = { path = "../launch-binder" }
+lantern-sdk = { git = "https://github.com/lantern-os/lantern-sdk", branch = "main", default-features = false, features = ["manifest"] }
+
+[dev-dependencies]
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# `lantern-boot` embeds this ELF in its own kernel image.
+strip = true

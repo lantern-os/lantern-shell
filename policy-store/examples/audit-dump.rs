@@ -108,6 +108,8 @@ fn reason_name(entry: &AuditEntry) -> &'static str {
         reason::PERSON_DENIED => "PERSON_DENIED",
         reason::REMEMBERED_DENIAL => "REMEMBERED_DENIAL",
         reason::NO_CONSENT => "NO_CONSENT",
+        reason::APP_ENDED => "APP_ENDED",
+        reason::NOT_REGISTERED => "NOT_REGISTERED",
         _ => "UNKNOWN",
     }
 }

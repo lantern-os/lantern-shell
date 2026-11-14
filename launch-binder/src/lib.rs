@@ -11,7 +11,8 @@
 
 extern crate alloc;
 
-use lantern_abi::grant::{ListedGrant, INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
+use lantern_abi::frame::status;
+use lantern_abi::grant::{ListedGrant, APP_SLOTS, INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
 use lantern_abi::policy::{reason, RevocationKey};
 use lantern_crypto::KeyOps;
 use lantern_filesystem::FileOps;
@@ -273,6 +274,54 @@ impl BoundSlots {
     }
 }
 
+/// [RFC-0029](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0029-a-confined-launcher.md): which package each app slot runs, as the
+/// launcher registered it, and each slot's own bound requests. The binder verified every package itself; a
+/// registration only names one of them.
+#[derive(Default)]
+pub struct Registry {
+    apps: [Option<u8>; APP_SLOTS],
+    bound: [BoundSlots; APP_SLOTS],
+}
+
+impl Registry {
+    /// `REGISTER`: an RFC-0019 status. `INVALID` unless `app` is a free slot and `verified` says the binder itself
+    /// verified `package`.
+    pub fn register(&mut self, app: usize, package: usize, verified: impl Fn(usize) -> bool) -> u16 {
+        match (self.apps.get(app), u8::try_from(package)) {
+            (Some(None), Ok(index)) if verified(package) => {
+                self.apps[app] = Some(index);
+                self.bound[app] = BoundSlots::default();
+                status::OK
+            }
+            _ => status::INVALID,
+        }
+    }
+
+    /// The package app slot `app` runs, if one is registered.
+    pub fn package(&self, app: usize) -> Option<u8> {
+        *self.apps.get(app)?
+    }
+
+    /// `UNREGISTER`: the slot is free again. The caller ends its grants first.
+    pub fn unregister(&mut self, app: usize) {
+        if let Some(registered) = self.apps.get_mut(app) {
+            *registered = None;
+            self.bound[app] = BoundSlots::default();
+        }
+    }
+
+    /// [`BoundSlots::claim`], for a registered app slot: `Some` with the ledger index, which is its own range's.
+    pub fn claim(&mut self, app: usize, interface: usize, slot: usize) -> Option<usize> {
+        self.package(app)?;
+        Some(app * MAX_BINDS + self.bound[app].claim(interface, slot)?)
+    }
+
+    /// The ledger indexes app slot `app`'s grants can occupy.
+    pub fn ledger_range(app: usize) -> core::ops::Range<usize> {
+        app * MAX_BINDS..(app + 1) * MAX_BINDS
+    }
+}
+
 /// A granted request, as the binder remembers it (RFC-0021).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct LedgerEntry {
@@ -283,6 +332,8 @@ pub struct LedgerEntry {
     pub badge: u64,
     /// What `RECORD` names to the policy store.
     pub key: RevocationKey,
+    /// Which package asked: the package set's index with a launcher, otherwise 0, the one package.
+    pub package: u8,
     pub revoked: bool,
     pub durable: bool,
 }
@@ -300,19 +351,39 @@ impl LedgerEntry {
     }
 }
 
-/// What this launch granted, indexed as [`BoundSlots::claim`] numbered it. A declined request
-/// leaves its index empty. It lives in memory: what outlives a reboot is the policy store's record
+/// What this launch granted, indexed as [`BoundSlots::claim`] numbered it, or, with a launcher, app slot
+/// `app`'s at `app × MAX_BINDS` on ([`Registry::claim`]). A declined request leaves its index empty. It lives in memory: what outlives a reboot is the policy store's record
 /// of a revocation, which [`LedgerEntry::durable`] reports.
 #[derive(Default)]
 pub struct Ledger {
-    entries: [Option<LedgerEntry>; MAX_BINDS],
+    entries: [Option<LedgerEntry>; LEDGER_LEN],
 }
+
+/// Every app slot's grants.
+pub const LEDGER_LEN: usize = MAX_BINDS * APP_SLOTS;
 
 impl Ledger {
     /// Call only after the service answered `OK`.
-    pub fn record(&mut self, index: usize, interface: Interface, slot: u8, binding: Binding, badge: u64, key: RevocationKey) {
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        index: usize,
+        interface: Interface,
+        slot: u8,
+        binding: Binding,
+        badge: u64,
+        key: RevocationKey,
+        package: u8,
+    ) {
         if let Some(entry) = self.entries.get_mut(index) {
-            *entry = Some(LedgerEntry { interface, slot, binding, badge, key, revoked: false, durable: false });
+            *entry = Some(LedgerEntry { interface, slot, binding, badge, key, package, revoked: false, durable: false });
+        }
+    }
+
+    /// Forgets the entry at `index`: its app ended, and its grant with it.
+    pub fn clear(&mut self, index: usize) {
+        if let Some(entry) = self.entries.get_mut(index) {
+            *entry = None;
         }
     }
 
@@ -339,6 +410,33 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registration_names_only_a_verified_package_in_a_free_slot() {
+        let mut registry = Registry::default();
+        let verified = |p| p == 1;
+        assert_eq!(registry.register(0, 0, verified), status::INVALID, "not verified");
+        assert_eq!(registry.register(APP_SLOTS, 1, verified), status::INVALID, "no such slot");
+        assert_eq!(registry.register(0, 1, verified), status::OK);
+        assert_eq!(registry.register(0, 1, verified), status::INVALID, "already taken");
+        assert_eq!((registry.package(0), registry.package(1)), (Some(1), None));
+    }
+
+    #[test]
+    fn each_app_binds_once_in_its_own_ledger_range_and_unregistering_starts_it_over() {
+        let mut registry = Registry::default();
+        assert_eq!(registry.claim(2, 1, 0), None, "unregistered");
+        registry.register(2, 0, |_| true);
+        registry.register(3, 0, |_| true);
+        let first = registry.claim(2, 1, 0).unwrap();
+        assert!(Registry::ledger_range(2).contains(&first));
+        assert_eq!(registry.claim(2, 1, 0), None, "once per run");
+        assert!(Registry::ledger_range(3).contains(&registry.claim(3, 1, 0).unwrap()), "another app's is its own");
+        registry.unregister(2);
+        assert_eq!(registry.claim(2, 1, 0), None);
+        registry.register(2, 0, |_| true);
+        assert_eq!(registry.claim(2, 1, 0), Some(first), "a new run starts over");
+    }
     use lantern_crypto::signing::SigningKey;
     use lantern_sdk::package::{encode_package, sign_package};
     use std::string::String;
@@ -504,7 +602,7 @@ mod tests {
         assert_eq!(ledger.get(0), None);
 
         let binding = Binding { object: 7, ops: KeyOps::SIGN.bits() };
-        ledger.record(2, Interface::Keystore, 1, binding, 0xabcd, [1, 2]);
+        ledger.record(2, Interface::Keystore, 1, binding, 0xabcd, [1, 2], 0);
         assert_eq!(ledger.get(0), None, "other indexes stay empty");
 
         let entry = ledger.get(2).unwrap();
@@ -521,8 +619,8 @@ mod tests {
     fn marking_revoked_touches_one_entry_and_tolerates_a_bad_index() {
         let mut ledger = Ledger::default();
         let binding = Binding { object: 0, ops: 1 };
-        ledger.record(0, Interface::Keystore, 0, binding, 1, [1, 1]);
-        ledger.record(1, Interface::Filesystem, 0, binding, 2, [2, 2]);
+        ledger.record(0, Interface::Keystore, 0, binding, 1, [1, 1], 0);
+        ledger.record(1, Interface::Filesystem, 0, binding, 2, [2, 2], 0);
 
         ledger.mark_revoked(0);
         ledger.mark_revoked(3);
@@ -536,7 +634,7 @@ mod tests {
     #[test]
     fn durable_is_separate_from_revoked() {
         let mut ledger = Ledger::default();
-        ledger.record(0, Interface::Keystore, 0, Binding { object: 0, ops: 1 }, 1, [1, 1]);
+        ledger.record(0, Interface::Keystore, 0, Binding { object: 0, ops: 1 }, 1, [1, 1], 0);
         ledger.mark_revoked(0);
         assert!(!ledger.get(0).unwrap().durable);
         ledger.mark_durable(0);
@@ -571,7 +669,7 @@ mod tests {
     #[test]
     fn an_out_of_range_record_is_dropped() {
         let mut ledger = Ledger::default();
-        ledger.record(MAX_BINDS, Interface::Keystore, 0, Binding { object: 0, ops: 1 }, 1, [1, 1]);
+        ledger.record(MAX_BINDS, Interface::Keystore, 0, Binding { object: 0, ops: 1 }, 1, [1, 1], 0);
         assert!((0..MAX_BINDS).all(|index| ledger.get(index).is_none()));
     }
 
