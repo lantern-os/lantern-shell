@@ -55,10 +55,24 @@
   seconds is `NO_CONSENT`, so a person who walked away, or a shell that hung, can't hold grants forever. The binder confirms
   each outcome to the shell, which says what was decided only then, and reports a late answer as too late. The shell holds
   no clock.
+- **A confined launcher (2026-11-14, [RFC-0029](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0029-a-confined-launcher.md)/[ADR-0035](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0035-a-confined-launcher.md)).** A new program, **`launcher/`**, builds an app's process from a signed
+  package when the shell asks, through system calls alone, in one of 4 app slots, and reclaims it when it ends.
+  - **How it builds an app:** it splits its `Untyped` into 18 MiB slots, verifies the package set with the binder's own
+    code, and copies the runtime's ELF and a private copy of the package into the slot's Frames. It maps in the slot's
+    channel, registers the slot with the binder, and starts the runtime.
+  - **When an app ends:** a report or a fault makes it `UNREGISTER`, `Reset` the slot, clear its channels, and tell the
+    shell.
+  - **`launch-binder`** gains `WITH_LAUNCHER`: it verifies every package in the set itself, and `REGISTER`/`UNREGISTER`
+    come from the launcher alone. Each app binds under its own slot's badge, in its own ledger range (`Registry`), and each
+    grant names the slot's channel. `UNREGISTER` revokes the slot's grants and records `REVOKING` with `APP_ENDED`.
+  - **The shell** gains `apps` and `run NAME`, through a page it shares with the launcher, and says when each app ends.
+  - **Tests:** 4 launcher tests, 25 binder tests, 7 shell tests. `lantern-boot`'s `console-matrix.sh` now has 21 cases,
+    and every app is started with `run`.
 ## Next
 - A person-set consent limit and a visible countdown; and scoped, time-bounded grants with standard capability shapes, so
   prompts say what they mean (SH2).
-- A user-space launcher, so a person can choose which app runs (the roadmap's installable-system track, step 3).
+- Stopping a running app from the console, and an app starting another app with its own consent (RFC-0029's future
+  possibilities).
 - A recovery path for a corrupt store.
 - Design the consent UX and standard capability shapes (with [`lantern-ai-runtime`](https://github.com/lantern-os/lantern-ai-runtime) and [`lantern-sdk`](https://github.com/lantern-os/lantern-sdk)).
 

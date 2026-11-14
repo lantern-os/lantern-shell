@@ -113,10 +113,14 @@ pub fn parse_answer(line: &[u8]) -> Option<Answer> {
     }
 }
 
-/// A console command. The language is deliberately tiny: there's no way to run anything.
+/// A console command. The language is deliberately tiny: `run` starts only a verified app the launcher lists, by name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Command {
+pub enum Command<'a> {
     Help,
+    /// The apps the launcher can run ([RFC-0029](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0029-a-confined-launcher.md)).
+    Apps,
+    /// Start the app with this name: printable, no spaces, at most `launcher::NAME_MAX` bytes.
+    Run(&'a [u8]),
     Grants,
     Revoke(usize),
     Audit(usize),
@@ -129,15 +133,25 @@ pub enum Command {
 /// How many audit records `audit` shows without a number.
 pub const AUDIT_DEFAULT: usize = 12;
 
-pub fn parse_command(line: &[u8]) -> Command {
+pub fn parse_command(line: &[u8]) -> Command<'_> {
     let line = trim(line);
     let mut words = line.split(|&b| b == b' ').filter(|w| !w.is_empty());
     let Some(word) = words.next() else { return Command::Empty };
-    let number = words.next().map(parse_number);
+    let argument = words.next();
     if words.next().is_some() {
         return Command::Unknown;
     }
+    if word == b"run" {
+        return match argument {
+            Some(name) if name.len() <= lantern_abi::launcher::NAME_MAX && name.iter().all(|b| b.is_ascii_graphic()) => {
+                Command::Run(name)
+            }
+            _ => Command::Unknown,
+        };
+    }
+    let number = argument.map(parse_number);
     match (word, number) {
+        (b"apps", None) => Command::Apps,
         (b"help", None) => Command::Help,
         (b"grants", None) => Command::Grants,
         (b"decisions", None) => Command::Decisions,
@@ -258,11 +272,15 @@ pub fn reason_name(event: u8, reason: u8) -> &'static str {
         r::PERSON_DENIED => "you said no",
         r::REMEMBERED_DENIAL => "you said never",
         r::NO_CONSENT => "nobody answered",
+        r::APP_ENDED => "the app ended",
+        r::NOT_REGISTERED => "not a running app",
         _ => "",
     }
 }
 
 pub const HELP: &str = "\
+  apps         the apps you can run\n\
+  run NAME     start an app; it asks for what it needs\n\
   grants       what each app holds now\n\
   revoke N     end grant N now; it's asked again next time\n\
   audit [N]    the last N records of the audit log, verified first\n\
@@ -338,8 +356,17 @@ mod tests {
         assert_eq!(parse_command(b"audit"), Command::Audit(AUDIT_DEFAULT));
         assert_eq!(parse_command(b"audit 40"), Command::Audit(40));
         assert_eq!(parse_command(b"forget 2"), Command::Forget(2));
+        assert_eq!(parse_command(b"apps"), Command::Apps);
+        assert_eq!(parse_command(b" run  confined-fs-probe "), Command::Run(b"confined-fs-probe"));
+        for line in [&b"run"[..], b"run a b", b"run \x1b[2J", b"apps 1"] {
+            assert_eq!(parse_command(line), Command::Unknown, "{line:?}");
+        }
+        let long = [b'x'; lantern_abi::launcher::NAME_MAX + 1];
+        let mut line = b"run ".to_vec();
+        line.extend_from_slice(&long);
+        assert_eq!(parse_command(&line), Command::Unknown, "too long");
         assert_eq!(parse_command(b""), Command::Empty);
-        for line in [&b"revoke"[..], b"revoke x", b"revoke 1 2", b"run probe", b"grants 1", b"revoke 99999999"] {
+        for line in [&b"revoke"[..], b"revoke x", b"revoke 1 2", b"grants 1", b"revoke 99999999"] {
             assert_eq!(parse_command(line), Command::Unknown, "{line:?}");
         }
     }

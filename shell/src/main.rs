@@ -12,6 +12,11 @@
 //!
 //! What it shows of an app's text goes through `lantern_shell::sanitized` (see `lib.rs`).
 //!
+//! **It asks the launcher to run apps** ([RFC-0029](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0029-a-confined-launcher.md)): `apps`
+//! and `run NAME` write a command into the page it shares with the launcher and signal it, and the launcher's reply, and
+//! later each app's end, arrive as more bits on the same notification. Only the shell can ask, so a person starts every
+//! app. Names and descriptions come from packages, and are sanitized like everything else an app says.
+//!
 //! **It never claims an answer counted until the binder says so** ([RFC-0028](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0028-deadlines-and-a-capability-clock.md)):
 //! a request can time out while the person types. The binder answers each request with `ASK_DONE` (it took the answer) or
 //! `ASK_CANCELLED` (it timed out first), and only then does the console say what was decided.
@@ -24,7 +29,8 @@ use core::fmt::Write;
 
 use lantern_abi::consent::{self, bit, Answer};
 use lantern_abi::frame::status;
-use lantern_abi::grant;
+use lantern_abi::grant::{self, APP_SLOTS};
+use lantern_abi::launcher::{self, outcome, shell_bit, OP_LIST, OP_RUN};
 use lantern_abi::policy::{self, decision};
 use lantern_abi::sys::{self, irq};
 use lantern_policy_store::audit::chain;
@@ -44,13 +50,17 @@ const CONTROL_CPTR: usize = 4;
 const READER_CPTR: usize = 5;
 /// The binder's answer notification, badged once each: `Answer::AllowOnce`, `AllowAlways`, `Deny`, `DenyAlways`.
 const ANSWER_CPTR_BASE: usize = 6;
+/// The launcher's notification, badged `launcher::bit::COMMAND`.
+const LAUNCHER_CPTR: usize = 10;
 
 /// Must equal the system loader's: the UART's page, and the consent `Frame` shared with the binder.
 const UART_VADDR: usize = 0x9500_0000;
 const CONSENT_VADDR: usize = 0x9000_0000;
+/// The page shared with the launcher.
+const LAUNCHER_VADDR: usize = 0x9001_0000;
 
-/// The binder's ledger size, `launch-binder`'s `MAX_BINDS`.
-const LEDGER_SIZE: usize = 4;
+/// The binder's ledger size, `launch-binder`'s `LEDGER_LEN`: `MAX_BINDS` for each app slot.
+const LEDGER_SIZE: usize = 4 * APP_SLOTS;
 /// Most remembered decisions `decisions` lists.
 const DECISIONS_MAX: usize = 64;
 
@@ -110,6 +120,42 @@ fn asked() -> Option<consent::Ask<'static>> {
     consent::decode_ask(half)
 }
 
+fn launcher_page() -> &'static mut [u8] {
+    // SAFETY: the loader mapped the 4 KiB page shared with the launcher read/write at LAUNCHER_VADDR for this program's
+    // whole life. This program writes a command only when none is outstanding, and reads the reply only after the
+    // launcher signals `REPLIED`, so the two never touch it at once.
+    unsafe { core::slice::from_raw_parts_mut(LAUNCHER_VADDR as *mut u8, 4096) }
+}
+
+/// An app's name, as the person typed it, kept for what the console says about it later.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Name {
+    bytes: [u8; launcher::NAME_MAX],
+    len: usize,
+}
+
+impl Name {
+    const NONE: Self = Self { bytes: [0; launcher::NAME_MAX], len: 0 };
+
+    fn new(name: &[u8]) -> Self {
+        let mut bytes = [0; launcher::NAME_MAX];
+        let len = name.len().min(launcher::NAME_MAX);
+        bytes[..len].copy_from_slice(&name[..len]);
+        Self { bytes, len }
+    }
+
+    fn get(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+/// A command the launcher hasn't answered yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Launch {
+    List,
+    Run(Name),
+}
+
 fn run(_arg0: usize) -> ! {
     let mut out = Console;
     let bound = irq::set_notification(IRQ_CPTR, CONSOLE_BIT_CPTR).is_ok();
@@ -122,8 +168,17 @@ fn run(_arg0: usize) -> ! {
 
     let mut editor = LineEditor::default();
     let mut state = Prompt::Idle;
+    let mut launching: Option<Launch> = None;
+    let mut running = [Name::NONE; APP_SLOTS];
     loop {
         let bits = sys::wait(NOTIFY_CPTR).unwrap_or(0);
+        // The launcher's answer comes before a request its app may already have made.
+        if bits & shell_bit::REPLIED != 0 {
+            if let Some(launch) = launching.take() {
+                launched(&mut out, launch, &mut running);
+                let _ = out.write_str(if state == Prompt::Asking { "allow? > " } else { "> " });
+            }
+        }
         // The binder's verdict on the last request comes before any new one.
         if bits & bit::ASK_DONE != 0 {
             if let Prompt::Sent(chosen) = state {
@@ -168,7 +223,7 @@ fn run(_arg0: usize) -> ! {
                         let _ = out.write_str("\n");
                         let mut line = [0; LINE_MAX];
                         let len = editor.take(&mut line);
-                        state = handle_line(&mut out, &line[..len], state);
+                        state = handle_line(&mut out, &line[..len], state, &mut launching);
                     }
                     Key::Ignore => {}
                 }
@@ -177,6 +232,16 @@ fn run(_arg0: usize) -> ! {
         }
         if bits & bit::SYSTEM_FAILED != 0 {
             let _ = write!(out, "\nlantern: a system service stopped with an error. Grants may be refused from now on.\n> ");
+        }
+        for (app, name) in running.iter_mut().enumerate() {
+            let failed = bits & shell_bit::failed(app) != 0;
+            if failed || bits & shell_bit::ended(app) != 0 {
+                let how = if failed { "stopped with an error" } else { "finished" };
+                let asking = state == Prompt::Asking;
+                let shown = sanitized(name.get());
+                let _ = write!(out, "\nlantern: \"{shown}\" {how}.\n{}", if asking { "allow? > " } else { "> " });
+                *name = Name::NONE;
+            }
         }
         if bits & (bit::APP_DONE | bit::APP_FAILED) != 0 {
             let how = if bits & bit::APP_FAILED != 0 { "stopped with an error" } else { "finished" };
@@ -205,8 +270,44 @@ enum Prompt {
     TimedOut,
 }
 
+/// Says what the launcher answered.
+fn launched(out: &mut Console, launch: Launch, running: &mut [Name; APP_SLOTS]) {
+    let Some((reply, entries)) = launcher::decode_reply(&launcher_page()[launcher::REPLY_OFFSET..]) else {
+        let _ = out.write_str("lantern: the launcher's answer couldn't be read.\n");
+        return;
+    };
+    match launch {
+        Launch::List => {
+            let mut any = false;
+            for (name, description) in entries {
+                any = true;
+                // `sanitized` shows each byte as one character, so its width is the name's length.
+                let pad = 22usize.saturating_sub(name.len());
+                let _ = writeln!(out, "  {}{:pad$} {}", sanitized(name), "", sanitized(description));
+            }
+            if !any {
+                let _ = out.write_str("  no apps\n");
+            }
+        }
+        Launch::Run(name) => {
+            let shown = sanitized(name.get());
+            let _ = match reply.outcome {
+                outcome::OK if (reply.app as usize) < APP_SLOTS => {
+                    running[reply.app as usize] = name;
+                    writeln!(out, "lantern: \"{shown}\" started.")
+                }
+                outcome::UNKNOWN => writeln!(out, "lantern: there's no app called \"{shown}\"; type apps."),
+                outcome::UNVERIFIED => writeln!(out, "lantern: \"{shown}\" didn't verify, and wasn't started."),
+                outcome::NO_ROOM => writeln!(out, "lantern: no room: {APP_SLOTS} apps are running already."),
+                outcome::NO_MEMORY => writeln!(out, "lantern: \"{shown}\" didn't fit in memory, and wasn't started."),
+                _ => writeln!(out, "lantern: \"{shown}\" couldn't be started."),
+            };
+        }
+    }
+}
+
 /// One typed line. Returns where the console is now.
-fn handle_line(out: &mut Console, line: &[u8], state: Prompt) -> Prompt {
+fn handle_line(out: &mut Console, line: &[u8], state: Prompt, launching: &mut Option<Launch>) -> Prompt {
     match state {
         Prompt::Asking => {
             let Some(chosen) = parse_answer(line) else {
@@ -226,8 +327,26 @@ fn handle_line(out: &mut Console, line: &[u8], state: Prompt) -> Prompt {
         }
         _ => {}
     }
-    match parse_command(line) {
+    let command = parse_command(line);
+    if launching.is_some() && command != Command::Empty {
+        let _ = out.write_str("lantern: wait: the launcher is answering.\n");
+        return state;
+    }
+    match command {
         Command::Empty => {}
+        Command::Apps | Command::Run(_) => {
+            let (op, name, launch) = match command {
+                Command::Run(name) => (OP_RUN, name, Launch::Run(Name::new(name))),
+                _ => (OP_LIST, &b""[..], Launch::List),
+            };
+            launcher::encode_command(&launcher::Command { op, name }, &mut launcher_page()[launcher::COMMAND_OFFSET..]);
+            if sys::signal(LAUNCHER_CPTR).is_ok() {
+                // The reply prints the prompt.
+                *launching = Some(launch);
+                return Prompt::Idle;
+            }
+            let _ = out.write_str("lantern: the launcher couldn't be reached.\n");
+        }
         Command::Help => {
             let _ = out.write_str(HELP);
         }
