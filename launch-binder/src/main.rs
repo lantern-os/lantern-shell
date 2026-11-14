@@ -27,6 +27,14 @@
 //! with the person's reason, is recorded before anything else happens. A revoke from the console ends the grant and
 //! forgets any "always", so the person is asked again next time; "never" is how a person says no for good.
 //!
+//! **With a launcher** ([RFC-0029](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0029-a-confined-launcher.md), the `WITH_LAUNCHER` flag),
+//! it serves many apps. It reads and verifies every package in the set itself, from its own read-only mapping, and trusts
+//! nothing the launcher says about them. The launcher `REGISTER`s which package each app slot runs, under a badge only it
+//! holds, and each app's `BIND`s come under that slot's own badge. A badge with nothing registered is declined. Each slot
+//! has its own bound requests, ledger range and grant capability slots, and each grant names the slot's channel to the
+//! service. When an app ends, `UNREGISTER` revokes its grants at their services, records `REVOKING` with `APP_ENDED`, and
+//! drops this program's copies.
+//!
 //! **A request has a time limit** ([RFC-0028](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0028-deadlines-and-a-capability-clock.md)): 60
 //! seconds, or less if the launcher says so. Nobody answering by then is `NO_CONSENT`, and the shell is told, so a person
 //! who walked away, or a shell that hung, can't hold grants forever. The binder arms its own `Deadline`, so the limit
@@ -38,15 +46,21 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 use lantern_abi::consent::{self, Answer, Ask};
 use lantern_abi::frame::status;
-use lantern_abi::grant::{self, ListedDecision, CONTROL_BADGE, CONTROL_DECISIONS, CONTROL_FORGET, CONTROL_LIST, CONTROL_REVOKE};
+use lantern_abi::grant::{
+    self, ListedDecision, CONTROL_BADGE, CONTROL_DECISIONS, CONTROL_FORGET, CONTROL_LIST, CONTROL_REVOKE, REGISTER, REGISTER_BADGE,
+    UNREGISTER,
+};
+use lantern_abi::launcher;
 use lantern_abi::policy::{decision, event, reason, AuditEntry};
 use lantern_abi::sys::deadline;
 use lantern_abi::{policy, sys};
 use lantern_launch_binder::{
     decide, outcome, read_package, remembered, request, revocation_key, role_for_key, BoundSlots, Interface, Ledger,
-    PublisherKey, Remembered, MAX_BINDS, POLICY, TRUSTED_PUBLISHERS,
+    PublisherKey, Registry, Remembered, MAX_BINDS, POLICY, TRUSTED_PUBLISHERS,
 };
 use lantern_sdk::GrantPlan;
 
@@ -69,6 +83,10 @@ const DEADLINE_CPTR: usize = POLICY_STORE_CPTR + 3;
 const ANSWER_TIMED_OUT_CPTR: usize = POLICY_STORE_CPTR + 4;
 const SHELL_DONE_CPTR: usize = POLICY_STORE_CPTR + 5;
 const SHELL_CANCELLED_CPTR: usize = POLICY_STORE_CPTR + 6;
+/// RFC-0029, with a launcher only: this program's own CNode, to drop its copies of an ended app's grants, and where
+/// each app slot's grants land, `MAX_BINDS` each.
+const SELF_CNODE_CPTR: usize = POLICY_STORE_CPTR + 7;
+const APP_GRANT_CPTR_BASE: usize = 40;
 /// `arg0`'s bits 48 to 55: the consent limit in seconds, if the launcher wants it below `consent::LIMIT_NS`. 0 means the
 /// default. It can only lower it.
 const LIMIT_SHIFT: usize = 48;
@@ -78,7 +96,8 @@ const CONSENT_VADDR: usize = 0x9000_0000;
 /// Must equal `lantern_boot::launch::HEAP_VADDR`, sized by the loader's `heap_megapages`.
 const HEAP_BASE: usize = 0x8620_0000;
 const HEAP_LEN: usize = 0x20_0000;
-/// Must equal `lantern_boot::launch::PACKAGE_VADDR`; the exact length arrives in `arg0`.
+/// Must equal `lantern_boot::launch::PACKAGE_VADDR`; the exact length arrives in `arg0`. With a launcher, the package
+/// set is there instead (`launcher::SET_VADDR`), and `arg0` carries how many packages it holds.
 const PACKAGE_VADDR: usize = 0x8c00_0000;
 const PACKAGE_MAX_LEN: usize = 0x20_0000;
 
@@ -114,28 +133,59 @@ fn run(arg0: usize) -> ! {
     // VSpace before its first instruction ran (`ProgramSpec::heap_megapages`).
     unsafe { lantern_abi::rt::init_heap(HEAP_BASE, HEAP_LEN) };
 
-    let package = (package_len <= PACKAGE_MAX_LEN)
-        .then(|| {
-            // SAFETY: the loader mapped `PACKAGE_MAX_LEN` bytes read-only at `PACKAGE_VADDR`
-            // for this program's whole life (`launch::map_package`), and nothing maps over it.
-            let lpkg = unsafe { core::slice::from_raw_parts(PACKAGE_VADDR as *const u8, package_len) };
-            read_package(lpkg, TRUSTED_PUBLISHERS)
-        })
-        .flatten();
+    let with_launcher = arg0 & grant::WITH_LAUNCHER != 0;
+    let packages: Vec<Package> = if with_launcher {
+        (0..package_len.min(launcher::SET_MAX))
+            .map(|i| {
+                // SAFETY: with a launcher, the loader mapped `package_len` set Frames read-only, consecutively, at
+                // `SET_VADDR` for this program's whole life, and nothing maps over them.
+                let frame = unsafe {
+                    core::slice::from_raw_parts((launcher::SET_VADDR + i * launcher::SET_STRIDE) as *const u8, launcher::SET_STRIDE)
+                };
+                launcher::set_entry(frame).and_then(|lpkg| read_package(lpkg, TRUSTED_PUBLISHERS))
+            })
+            .collect()
+    } else {
+        let package = (package_len <= PACKAGE_MAX_LEN)
+            .then(|| {
+                // SAFETY: the loader mapped `PACKAGE_MAX_LEN` bytes read-only at `PACKAGE_VADDR`
+                // for this program's whole life (`launch::map_package`), and nothing maps over it.
+                let lpkg = unsafe { core::slice::from_raw_parts(PACKAGE_VADDR as *const u8, package_len) };
+                read_package(lpkg, TRUSTED_PUBLISHERS)
+            })
+            .flatten();
+        alloc::vec![package]
+    };
 
     let mut bound = BoundSlots::default();
+    let mut registry = Registry::default();
     let mut ledger = Ledger::default();
     loop {
         let Ok(received) = sys::recv(BINDER_ENDPOINT_CPTR) else { continue };
         if received.badge == CONTROL_BADGE {
-            serve_control(&package, with_consent, &mut ledger, grant::control_request(&received));
+            serve_control(&packages, with_consent, &mut ledger, grant::control_request(&received));
+            continue;
+        }
+        if with_launcher && received.badge == REGISTER_BADGE {
+            serve_registration(&packages, &mut registry, &mut ledger, grant::registration_request(&received));
             continue;
         }
         let (interface, slot) = grant::bind_request(&received);
-        // Only a slot's first attempt is decided, or recorded: a caller can't fill the log by repeating one.
+        // Only a slot's first attempt is decided, or recorded: a caller can't fill the log by repeating one. With a
+        // launcher, that's per run of an app slot, and a badge with nothing registered is declined without a record.
         let consent = with_consent.then_some(Consent { timed, limit });
-        let granted =
-            bound.claim(interface, slot).and_then(|index| bind(&package, consent, &mut ledger, index, interface, slot));
+        let claimed = if with_launcher {
+            grant::app_for_badge(received.badge).and_then(|app| {
+                let package = registry.package(app)?;
+                Some((registry.claim(app, interface, slot)?, Some(app), package))
+            })
+        } else {
+            bound.claim(interface, slot).map(|index| (index, None, 0))
+        };
+        let granted = claimed.and_then(|(index, app, package)| {
+            let request = Request { index, interface, slot, app, package };
+            bind(&packages[package as usize], consent, &mut ledger, request)
+        });
         let _ = match granted {
             Some(dest) => grant::reply_granted(dest),
             None => grant::reply_declined(),
@@ -143,8 +193,26 @@ fn run(arg0: usize) -> ! {
     }
 }
 
-/// One first attempt at `(interface, slot)`: `Some` with the capability's slot if granted. Every outcome is
-/// recorded except one the log itself refused.
+/// A package as this program verified it, or `None` if it didn't.
+type Package = Option<(PublisherKey, GrantPlan)>;
+
+/// Where an app slot's ledger entry `index` keeps its capability: with a launcher, `APP_GRANT_CPTR_BASE` on.
+fn grant_cptr(app: Option<usize>, index: usize) -> usize {
+    match app {
+        Some(_) => APP_GRANT_CPTR_BASE + index,
+        None => GRANT_CPTR_BASE + index,
+    }
+}
+
+/// One `BIND` to decide: its ledger index, `(interface, slot)`, and, with a launcher, the app slot and its package.
+struct Request {
+    index: usize,
+    interface: usize,
+    slot: usize,
+    app: Option<usize>,
+    package: u8,
+}
+
 /// With consent: whether this program's deadline is bound, and the limit on each request.
 #[derive(Clone, Copy)]
 struct Consent {
@@ -152,14 +220,10 @@ struct Consent {
     limit: u64,
 }
 
-fn bind(
-    package: &Option<(PublisherKey, GrantPlan)>,
-    consent: Option<Consent>,
-    ledger: &mut Ledger,
-    index: usize,
-    interface_word: usize,
-    slot: usize,
-) -> Option<usize> {
+/// One first attempt at `(interface, slot)`: `Some` with the capability's slot if granted. Every outcome is
+/// recorded except one the log itself refused.
+fn bind(package: &Package, consent: Option<Consent>, ledger: &mut Ledger, request: Request) -> Option<usize> {
+    let Request { index, interface: interface_word, slot, app, package: package_index } = request;
     let mut entry =
         AuditEntry { event: event::DECLINED, interface: interface_word as u8, slot: slot as u8, ..AuditEntry::default() };
     // `Err(Some(reason))` is recorded as a decline; `Err(None)` has been recorded already, or can't be.
@@ -187,11 +251,13 @@ fn bind(
         if policy::append(POLICY_STORE_CPTR, &AuditEntry { event: event::GRANTING, ..entry }) != Ok(status::OK) {
             return Err(None);
         }
-        let dest = GRANT_CPTR_BASE + index;
-        match grant::request_grant(granter(interface), dest, binding.object as usize, binding.ops as usize) {
+        let dest = grant_cptr(app, index);
+        // With a launcher, the service ties the badge to this app slot's channel, and serves it there only.
+        let ops = grant::grant_ops(binding.ops, app);
+        match grant::request_grant(granter(interface), dest, binding.object as usize, ops) {
             Ok((status::OK, badge)) => {
                 // `decide` refuses a slot that doesn't fit.
-                ledger.record(index, interface, slot as u8, binding, badge, entry.subject);
+                ledger.record(index, interface, slot as u8, binding, badge, entry.subject, package_index);
                 // `GRANTING` already covers the grant, so failing to record this loses only the link from the badge
                 // to the role, which then shows as a `GRANTING` with nothing after it.
                 let granted = AuditEntry { event: event::GRANTED, subject: [badge, 0], ..entry };
@@ -281,8 +347,42 @@ fn granter(interface: Interface) -> usize {
     }
 }
 
+/// `REGISTER` and `UNREGISTER`, from the launcher alone.
+fn serve_registration(packages: &[Package], registry: &mut Registry, ledger: &mut Ledger, (op, app, package): (usize, usize, usize)) {
+    let status = match op {
+        REGISTER => registry.register(app, package, |p| packages.get(p).is_some_and(Option::is_some)),
+        UNREGISTER if registry.package(app).is_some() => {
+            let mut status = status::OK;
+            for index in Registry::ledger_range(app) {
+                let Some(entry) = ledger.get(index).copied() else { continue };
+                if !entry.revoked {
+                    let ending = AuditEntry {
+                        event: event::REVOKING,
+                        reason: reason::APP_ENDED,
+                        interface: entry.interface.to_wire() as u8,
+                        slot: entry.slot,
+                        object: entry.binding.object,
+                        ops: entry.binding.ops,
+                        subject: entry.key,
+                    };
+                    let _ = policy::append(POLICY_STORE_CPTR, &ending);
+                    if grant::request_revoke(granter(entry.interface), entry.badge) != Ok(status::OK) {
+                        status = status::FAILED;
+                    }
+                }
+                let _ = sys::cnode::delete(SELF_CNODE_CPTR, grant_cptr(Some(app), index));
+                ledger.clear(index);
+            }
+            registry.unregister(app);
+            status
+        }
+        _ => status::INVALID,
+    };
+    let _ = sys::reply([0, status as usize, 0]);
+}
+
 fn serve_control(
-    package: &Option<(PublisherKey, GrantPlan)>,
+    packages: &[Package],
     with_consent: bool,
     ledger: &mut Ledger,
     (op, index): (usize, usize),
@@ -290,13 +390,13 @@ fn serve_control(
     let entry = ledger.get(index).copied();
     let words = match (op, entry) {
         (CONTROL_LIST, Some(entry)) => {
-            if let (true, Some((_, plan))) = (with_consent, package) {
+            if let (true, Some(Some((_, plan)))) = (with_consent, packages.get(entry.package as usize)) {
                 let role = request(plan, entry.interface, entry.slot as usize).map_or(&b""[..], |r| r.role.as_bytes());
                 ConsentFrame::names(plan.app.name.as_bytes(), role);
             }
             entry.listed().to_words()
         }
-        (CONTROL_DECISIONS, _) if with_consent => list_decision(package, index),
+        (CONTROL_DECISIONS, _) if with_consent => list_decision(packages, index),
         (CONTROL_FORGET, _) if with_consent => {
             let forgot = match policy::decision_read(POLICY_STORE_CPTR, index) {
                 Ok((status::OK, _, _, key)) => {
@@ -344,10 +444,14 @@ fn serve_control(
 
 /// `DECISIONS`: the `index`th remembered decision, with its names written to the consent `Frame` if it's one of this
 /// package's roles.
-fn list_decision(package: &Option<(PublisherKey, GrantPlan)>, index: usize) -> [usize; 2] {
+fn list_decision(packages: &[Package], index: usize) -> [usize; 2] {
     match policy::decision_read(POLICY_STORE_CPTR, index) {
         Ok((status::OK, decision, ops, key)) => {
-            let role = package.as_ref().and_then(|(publisher, plan)| Some((plan, role_for_key(publisher, plan, key)?)));
+            // Any verified package's role: a decision outlives the run that made it.
+            let role = packages
+                .iter()
+                .flatten()
+                .find_map(|(publisher, plan)| Some((plan, role_for_key(publisher, plan, key)?)));
             match role {
                 Some((plan, role)) => ConsentFrame::names(plan.app.name.as_bytes(), role.role.as_bytes()),
                 None => ConsentFrame::names(b"", b""),
@@ -361,3 +465,4 @@ fn list_decision(package: &Option<(PublisherKey, GrantPlan)>, index: usize) -> [
 }
 
 const _: () = assert!(SHELL_CANCELLED_CPTR < 32);
+const _: () = assert!(SELF_CNODE_CPTR < APP_GRANT_CPTR_BASE && APP_GRANT_CPTR_BASE + lantern_launch_binder::LEDGER_LEN <= 72);
