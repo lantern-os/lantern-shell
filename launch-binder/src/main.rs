@@ -26,6 +26,11 @@
 //! consent `Frame`, signals the shell, and waits for the answer, serving nothing else meanwhile. `CONSENTED`, or a decline
 //! with the person's reason, is recorded before anything else happens. A revoke from the console ends the grant and
 //! forgets any "always", so the person is asked again next time; "never" is how a person says no for good.
+//!
+//! **A request has a time limit** ([RFC-0028](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0028-deadlines-and-a-capability-clock.md)): 60
+//! seconds, or less if the launcher says so. Nobody answering by then is `NO_CONSENT`, and the shell is told, so a person
+//! who walked away, or a shell that hung, can't hold grants forever. The binder arms its own `Deadline`, so the limit
+//! doesn't depend on the shell.
 
 #![no_std]
 #![no_main]
@@ -37,6 +42,7 @@ use lantern_abi::consent::{self, Answer, Ask};
 use lantern_abi::frame::status;
 use lantern_abi::grant::{self, ListedDecision, CONTROL_BADGE, CONTROL_DECISIONS, CONTROL_FORGET, CONTROL_LIST, CONTROL_REVOKE};
 use lantern_abi::policy::{decision, event, reason, AuditEntry};
+use lantern_abi::sys::deadline;
 use lantern_abi::{policy, sys};
 use lantern_launch_binder::{
     decide, outcome, read_package, remembered, request, revocation_key, role_for_key, BoundSlots, Interface, Ledger,
@@ -57,6 +63,15 @@ const POLICY_STORE_CPTR: usize = GRANT_CPTR_BASE + MAX_BINDS;
 /// notification, which only the shell can signal.
 const SHELL_ASK_CPTR: usize = POLICY_STORE_CPTR + 1;
 const ANSWER_CPTR: usize = POLICY_STORE_CPTR + 2;
+/// RFC-0028, with consent only: this program's `Deadline`, its own answer notification badged `consent::TIMED_OUT` (to bind
+/// the deadline to), and the shell's notification badged `ASK_DONE` and `ASK_CANCELLED`.
+const DEADLINE_CPTR: usize = POLICY_STORE_CPTR + 3;
+const ANSWER_TIMED_OUT_CPTR: usize = POLICY_STORE_CPTR + 4;
+const SHELL_DONE_CPTR: usize = POLICY_STORE_CPTR + 5;
+const SHELL_CANCELLED_CPTR: usize = POLICY_STORE_CPTR + 6;
+/// `arg0`'s bits 48 to 55: the consent limit in seconds, if the launcher wants it below `consent::LIMIT_NS`. 0 means the
+/// default. It can only lower it.
+const LIMIT_SHIFT: usize = 48;
 /// Where the loader maps the consent `Frame`, shared with the shell. Must equal `launch::BINDER_CONSENT_VADDR`.
 const CONSENT_VADDR: usize = 0x9000_0000;
 
@@ -91,6 +106,10 @@ impl ConsentFrame {
 fn run(arg0: usize) -> ! {
     let with_consent = arg0 & grant::WITH_CONSENT != 0;
     let package_len = arg0 & (grant::WITH_CONSENT - 1);
+    let limit_s = ((arg0 >> LIMIT_SHIFT) & 0xff) as u64;
+    let limit = if limit_s == 0 { consent::LIMIT_NS } else { (limit_s * 1_000_000_000).min(consent::LIMIT_NS) };
+    // A deadline that can't be bound means no request can have a limit: `consent_for` then declines rather than wait forever.
+    let timed = with_consent && deadline::set_notification(DEADLINE_CPTR, ANSWER_TIMED_OUT_CPTR).is_ok();
     // SAFETY: the loader mapped `HEAP_BASE..+HEAP_LEN` read/write into this program's own
     // VSpace before its first instruction ran (`ProgramSpec::heap_megapages`).
     unsafe { lantern_abi::rt::init_heap(HEAP_BASE, HEAP_LEN) };
@@ -114,8 +133,9 @@ fn run(arg0: usize) -> ! {
         }
         let (interface, slot) = grant::bind_request(&received);
         // Only a slot's first attempt is decided, or recorded: a caller can't fill the log by repeating one.
+        let consent = with_consent.then_some(Consent { timed, limit });
         let granted =
-            bound.claim(interface, slot).and_then(|index| bind(&package, with_consent, &mut ledger, index, interface, slot));
+            bound.claim(interface, slot).and_then(|index| bind(&package, consent, &mut ledger, index, interface, slot));
         let _ = match granted {
             Some(dest) => grant::reply_granted(dest),
             None => grant::reply_declined(),
@@ -125,9 +145,16 @@ fn run(arg0: usize) -> ! {
 
 /// One first attempt at `(interface, slot)`: `Some` with the capability's slot if granted. Every outcome is
 /// recorded except one the log itself refused.
+/// With consent: whether this program's deadline is bound, and the limit on each request.
+#[derive(Clone, Copy)]
+struct Consent {
+    timed: bool,
+    limit: u64,
+}
+
 fn bind(
     package: &Option<(PublisherKey, GrantPlan)>,
-    with_consent: bool,
+    consent: Option<Consent>,
     ledger: &mut Ledger,
     index: usize,
     interface_word: usize,
@@ -150,8 +177,8 @@ fn bind(
             Ok(status::ACCESS) => return Err(Some(reason::REVOKED)),
             _ => return Err(Some(reason::STORE_UNAVAILABLE)),
         }
-        if with_consent {
-            let consented = consent_for(publisher, plan, interface, slot, entry.subject, binding.ops)?;
+        if let Some(consent) = consent {
+            let consented = consent_for(consent, publisher, plan, interface, slot, entry.subject, binding.ops)?;
             let record = AuditEntry { event: event::CONSENTED, reason: consented, ..entry };
             if policy::append(POLICY_STORE_CPTR, &record) != Ok(status::OK) {
                 return Err(None);
@@ -192,6 +219,7 @@ fn bind(
 /// the decline's. A remembered decision settles it without a prompt; an unreadable one declines, since a remembered
 /// "never" may be what's unreadable.
 fn consent_for(
+    consent: Consent,
     publisher: &PublisherKey,
     plan: &GrantPlan,
     interface: Interface,
@@ -210,6 +238,14 @@ fn consent_for(
         Remembered::Ask => {}
     }
     let request = request(plan, interface, slot).ok_or(Some(reason::NOT_DECLARED))?;
+    // RFC-0028: no request without a limit. Drain first, so a late answer or a stale timeout from an earlier request can't
+    // count for this one.
+    let _ = sys::poll(ANSWER_CPTR);
+    let armed = consent.timed
+        && deadline::now(DEADLINE_CPTR).is_ok_and(|now| deadline::arm(DEADLINE_CPTR, now.saturating_add(consent.limit)).is_ok());
+    if !armed {
+        return Err(Some(reason::NO_CONSENT));
+    }
     ConsentFrame::ask(&Ask {
         interface: interface.to_wire() as u8,
         ops,
@@ -220,7 +256,12 @@ fn consent_for(
         truncated: false,
     });
     // The shell can't be reached: nobody was asked, so nobody consented.
-    let answer = sys::signal(SHELL_ASK_CPTR).ok().and_then(|()| sys::wait(ANSWER_CPTR).ok()).and_then(Answer::from_badge);
+    let bits = sys::signal(SHELL_ASK_CPTR).ok().and_then(|()| sys::wait(ANSWER_CPTR).ok()).unwrap_or(0);
+    let _ = deadline::cancel(DEADLINE_CPTR);
+    // An answer wins over a timeout that arrived with it: the person answered by the time this looked.
+    let answer = Answer::from_badge(bits & !consent::TIMED_OUT);
+    // Tell the shell which happened, so it never claims an answer counted when it didn't.
+    let _ = sys::signal(if answer.is_some() { SHELL_DONE_CPTR } else { SHELL_CANCELLED_CPTR });
     let (decided, remember) = outcome(answer);
     if let Some(remember) = remember {
         // A failure to remember doesn't change this answer; it only means the person is asked again next time. An
@@ -319,4 +360,4 @@ fn list_decision(package: &Option<(PublisherKey, GrantPlan)>, index: usize) -> [
     }
 }
 
-const _: () = assert!(ANSWER_CPTR < 32);
+const _: () = assert!(SHELL_CANCELLED_CPTR < 32);

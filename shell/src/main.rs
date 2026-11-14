@@ -11,6 +11,10 @@
 //! deadlocking: the console takes only an answer.
 //!
 //! What it shows of an app's text goes through `lantern_shell::sanitized` (see `lib.rs`).
+//!
+//! **It never claims an answer counted until the binder says so** ([RFC-0028](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0028-deadlines-and-a-capability-clock.md)):
+//! a request can time out while the person types. The binder answers each request with `ASK_DONE` (it took the answer) or
+//! `ASK_CANCELLED` (it timed out first), and only then does the console say what was decided.
 
 #![no_std]
 #![no_main]
@@ -117,14 +121,34 @@ fn run(_arg0: usize) -> ! {
     let _ = out.write_str("> ");
 
     let mut editor = LineEditor::default();
-    let mut asking = false;
+    let mut state = Prompt::Idle;
     loop {
         let bits = sys::wait(NOTIFY_CPTR).unwrap_or(0);
+        // The binder's verdict on the last request comes before any new one.
+        if bits & bit::ASK_DONE != 0 {
+            if let Prompt::Sent(chosen) = state {
+                let said = match chosen {
+                    Answer::AllowOnce => "allowed, this time",
+                    Answer::AllowAlways => "allowed, and remembered",
+                    Answer::Deny => "refused, this time",
+                    Answer::DenyAlways => "refused, and remembered",
+                };
+                let _ = write!(out, "lantern: {said}.\n> ");
+            }
+            state = Prompt::Idle;
+        }
+        if bits & bit::ASK_CANCELLED != 0 {
+            let _ = out.write_str(match state {
+                Prompt::Sent(_) => "lantern: too late: the request had already timed out, and was refused.\n> ",
+                _ => "\nlantern: nobody answered in time, so the request was refused.\n> ",
+            });
+            state = Prompt::TimedOut;
+        }
         if bits & bit::ASK != 0 {
             match asked() {
                 Some(ask) => {
                     let _ = write_prompt(&mut out, &ask);
-                    asking = true;
+                    state = Prompt::Asking;
                 }
                 None => {
                     // The binder is waiting: it must get an answer, and the only safe one is no.
@@ -144,7 +168,7 @@ fn run(_arg0: usize) -> ! {
                         let _ = out.write_str("\n");
                         let mut line = [0; LINE_MAX];
                         let len = editor.take(&mut line);
-                        asking = handle_line(&mut out, &line[..len], asking);
+                        state = handle_line(&mut out, &line[..len], state);
                     }
                     Key::Ignore => {}
                 }
@@ -156,6 +180,7 @@ fn run(_arg0: usize) -> ! {
         }
         if bits & (bit::APP_DONE | bit::APP_FAILED) != 0 {
             let how = if bits & bit::APP_FAILED != 0 { "stopped with an error" } else { "finished" };
+            let asking = state == Prompt::Asking;
             let _ = write!(out, "\nlantern: the app {how}.\n{}", if asking { "allow? > " } else { "> " });
         }
     }
@@ -168,22 +193,38 @@ fn answer(answer: Answer) {
     }
 }
 
-/// One typed line. Returns whether a request is still open.
-fn handle_line(out: &mut Console, line: &[u8], asking: bool) -> bool {
-    if asking {
-        let Some(chosen) = parse_answer(line) else {
-            let _ = out.write_str("         please answer y, a, n or e > ");
-            return true;
-        };
-        answer(chosen);
-        let said = match chosen {
-            Answer::AllowOnce => "allowed, this time",
-            Answer::AllowAlways => "allowed, and remembered",
-            Answer::Deny => "refused, this time",
-            Answer::DenyAlways => "refused, and remembered",
-        };
-        let _ = write!(out, "lantern: {said}.\n> ");
-        return false;
+/// Where the console is with consent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prompt {
+    Idle,
+    /// A request is shown, and only an answer is taken: the binder is waiting, so a command that calls it would deadlock.
+    Asking,
+    /// An answer was sent, and the binder hasn't said yet whether it counted.
+    Sent(Answer),
+    /// The last request timed out. An answer typed now is too late, and is said to be.
+    TimedOut,
+}
+
+/// One typed line. Returns where the console is now.
+fn handle_line(out: &mut Console, line: &[u8], state: Prompt) -> Prompt {
+    match state {
+        Prompt::Asking => {
+            let Some(chosen) = parse_answer(line) else {
+                let _ = out.write_str("         please answer y, a, n or e > ");
+                return Prompt::Asking;
+            };
+            answer(chosen);
+            return Prompt::Sent(chosen);
+        }
+        Prompt::Sent(_) => {
+            let _ = out.write_str("lantern: wait: your answer is on its way.\n");
+            return state;
+        }
+        Prompt::TimedOut if parse_answer(line).is_some() => {
+            let _ = out.write_str("lantern: too late: that request timed out, and was refused.\n> ");
+            return Prompt::Idle;
+        }
+        _ => {}
     }
     match parse_command(line) {
         Command::Empty => {}
@@ -215,7 +256,7 @@ fn handle_line(out: &mut Console, line: &[u8], asking: bool) -> bool {
         }
     }
     let _ = out.write_str("> ");
-    false
+    Prompt::Idle
 }
 
 fn grants(out: &mut Console) {
