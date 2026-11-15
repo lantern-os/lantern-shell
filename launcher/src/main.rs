@@ -6,7 +6,9 @@
 //!
 //! - an `Untyped` for apps' memory, which it splits into one 18 MiB child per app slot;
 //! - its own CNode and VSpace, to copy pages in through a scratch mapping;
-//! - the runtime's ELF and the package set, read-only;
+//! - the runtime's ELF, read-only;
+//! - the volume, for the disk's packages partition, read-only, and 4 Frames to read packages into
+//!   ([RFC-0031](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md));
 //! - the binder's endpoint, under the registration badge and under each app slot's badge, none of which it can mint;
 //! - each app slot's keystore and store channel Frames, which boot mapped into the services, and nothing else of theirs;
 //! - the shell's notification, under the bits it may signal, and the page it shares with the shell.
@@ -29,6 +31,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+use lantern_abi::block::{self, Client};
+use lantern_abi::frame::Channel;
 use lantern_abi::grant::{self, APP_SLOTS, INTERFACE_KEYSTORE};
 use lantern_abi::launcher::{self, bit, outcome, Command, Reply};
 use lantern_abi::sys::{self, cnode, frame, retype, tcb, untyped};
@@ -49,6 +53,10 @@ const SHELL_ENDED: usize = 11;
 const SHELL_FAILED: usize = 15;
 const KS_CHANNEL: usize = 19;
 const ST_CHANNEL: usize = 23;
+/// RFC-0031: the volume, under its `LAUNCHER` badge, and the Frames packages are read into.
+const VOLUME: usize = 66;
+const SET_FRAMES: usize = 67;
+const SET_FRAME_COUNT: usize = 4;
 // Its own.
 const SLOT: usize = 27;
 const DONE: usize = 31;
@@ -73,6 +81,7 @@ const HEAP_BASE: usize = 0x8620_0000;
 const HEAP_LEN: usize = 0x20_0000;
 const RUNTIME_VADDR: usize = 0x8a00_0000;
 const COMMAND_VADDR: usize = 0x9000_0000;
+const VOLUME_VADDR: usize = 0x9001_0000;
 const SCRATCH_VADDR: usize = 0x9200_0000;
 const SMALL_SCRATCH_VADDR: usize = 0x9400_0000;
 
@@ -96,7 +105,7 @@ fn run(arg0: usize) -> ! {
     // SAFETY: the loader mapped `HEAP_BASE..+HEAP_LEN` read/write into this program's own VSpace.
     unsafe { lantern_abi::rt::init_heap(HEAP_BASE, HEAP_LEN) };
     let hold = arg0 & launcher::HOLD != 0;
-    let count = (arg0 & 0xff).min(launcher::SET_MAX);
+    let count = load_packages();
     let catalog = Catalog::new((0..count).map(|i| launcher::set_entry(set_frame(i))));
     let runtime = launcher::set_entry(runtime_frame()).unwrap_or_default();
 
@@ -123,14 +132,35 @@ fn run(arg0: usize) -> ! {
     }
 }
 
+/// Reads the disk's packages into this program's own Frames, mapped at `SET_VADDR` as the boot image's set was. Every
+/// package is verified after, by the catalog; the disk is trusted for nothing.
+fn load_packages() -> usize {
+    let rw = MapPerms::READ.union(MapPerms::WRITE).union(MapPerms::USER);
+    let mapped = (0..SET_FRAME_COUNT)
+        .take_while(|&i| frame::map(SET_FRAMES + i, SELF_VSPACE, launcher::SET_VADDR + i * launcher::SET_STRIDE, rw).is_ok())
+        .count();
+    let mut frames: Vec<&mut [u8]> = (0..mapped)
+        .map(|i| {
+            // SAFETY: Frame `i` was just mapped read/write here, one per stride, and nothing else maps it.
+            unsafe {
+                core::slice::from_raw_parts_mut((launcher::SET_VADDR + i * launcher::SET_STRIDE) as *mut u8, launcher::SET_STRIDE)
+            }
+        })
+        .collect();
+    // SAFETY: the loader mapped the channel shared with the volume read/write at VOLUME_VADDR.
+    let mut volume = Client { channel: unsafe { Channel::new(VOLUME, VOLUME_VADDR as *mut u8) } };
+    block::packages::load(&mut volume, &mut frames)
+}
+
 fn set_frame(i: usize) -> &'static [u8] {
-    // SAFETY: the loader mapped each of the set's Frames read-only, consecutively, at `SET_VADDR`, for this program's
-    // whole life.
+    // SAFETY: `load_packages` mapped each of the set's Frames, consecutively, at `SET_VADDR`, for this program's whole
+    // life, and nothing writes them after it.
     unsafe { core::slice::from_raw_parts((launcher::SET_VADDR + i * launcher::SET_STRIDE) as *const u8, launcher::SET_STRIDE) }
 }
 
 fn runtime_frame() -> &'static [u8] {
-    // SAFETY: as `set_frame`'s, for the runtime's ELF, in the set's format, at `RUNTIME_VADDR`.
+    // SAFETY: the loader mapped the runtime's ELF read-only, in the set's format, at `RUNTIME_VADDR`, for this program's
+    // whole life.
     unsafe { core::slice::from_raw_parts(RUNTIME_VADDR as *const u8, launcher::SET_STRIDE) }
 }
 

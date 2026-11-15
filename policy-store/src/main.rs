@@ -21,7 +21,11 @@
 #![no_main]
 #![forbid(unsafe_op_in_unsafe_fn)]
 
-use lantern_abi::frame::status;
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use lantern_abi::block::{self, Client, SECTOR};
+use lantern_abi::frame::{status, Channel};
 use lantern_abi::policy::{event, AuditEntry, Source};
 use lantern_abi::{policy, sys};
 use lantern_policy_store::audit::AuditLog;
@@ -36,6 +40,18 @@ const FAILURE_CPTR: usize = 4;
 
 /// Must equal `lantern_boot::launch::POLICY_FLASH_VADDR`.
 const FLASH_VADDR: usize = 0x9400_0000;
+
+/// [RFC-0032](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0032-installing-a-bootable-disk.md): `arg0`'s flag for keeping the log on the
+/// disk's policy partition instead of flash, which a machine booting through UEFI gives its firmware. The quota is
+/// `arg0`'s low 16 bits.
+const ON_DISK: usize = 1 << 20;
+/// The volume, under its `POLICY` badge, and its channel.
+const VOLUME_CPTR: usize = 5;
+const VOLUME_VADDR: usize = 0x9001_0000;
+/// The whole partition, mirrored in this program's heap megapage: the 8 sectors of 256 KiB the log uses on flash.
+const MIRROR_VADDR: usize = 0x8620_0000;
+const MIRROR_BYTES: usize = 8 * 0x4_0000;
+const WORDS_PER_SECTOR: usize = SECTOR / 4;
 
 const CMD_READ_ARRAY: u32 = 0x00ff_00ff;
 const CMD_PROGRAM: u32 = 0x0040_0040;
@@ -99,13 +115,134 @@ impl Flash for MappedFlash {
     }
 }
 
+/// The log on the disk: a mirror in memory, and every change written through, sector by sector, before it returns. A
+/// program clears bits, as on flash; erasing sets a sector back to all ones. A disk sector is written whole, so a record
+/// interrupted mid-way is torn exactly as on flash, and the log's own rules find it.
+struct DiskFlash(UnsafeCell<Option<Client>>);
+
+// SAFETY: this program is single-threaded, and reaches the mirror and the volume only through `AnyFlash`.
+unsafe impl Sync for DiskFlash {}
+
+static DISK: DiskFlash = DiskFlash(UnsafeCell::new(None));
+static ON_DISK_MODE: AtomicBool = AtomicBool::new(false);
+
+fn mirror() -> &'static mut [u32] {
+    // SAFETY: with ON_DISK, the loader mapped this program's heap megapage read/write at MIRROR_VADDR, and only
+    // `AnyFlash` touches it, one call at a time.
+    unsafe { core::slice::from_raw_parts_mut(MIRROR_VADDR as *mut u32, MIRROR_BYTES / 4) }
+}
+
+fn volume() -> &'static mut Client {
+    // SAFETY: as `mirror`: set once in `run` before any `AnyFlash` exists.
+    unsafe { (*DISK.0.get()).as_mut().expect("the disk is opened first") }
+}
+
+/// Writes the disk sectors holding words `[first, first + words)` from the mirror. `false` if any write failed.
+fn write_through(first: usize, words: usize) -> bool {
+    let start = first / WORDS_PER_SECTOR;
+    let end = (first + words).div_ceil(WORDS_PER_SECTOR);
+    let mut sector = start;
+    while sector < end {
+        let count = (end - sector).min(block::MAX_SECTORS);
+        let words = &mirror()[sector * WORDS_PER_SECTOR..(sector + count) * WORDS_PER_SECTOR];
+        let mut bytes = [0u8; block::MAX_BYTES];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        if volume().write(sector as u64, &bytes[..count * SECTOR]).is_err() {
+            return false;
+        }
+        sector += count;
+    }
+    true
+}
+
+/// Reloads the mirror's words `[first, first + words)` from the disk: after a write that failed, the mirror says what the
+/// disk does. Best effort: if that fails too, the next boot reads the disk afresh.
+fn reload(first: usize, words: usize) {
+    let mut bytes = [0u8; block::MAX_BYTES];
+    let (start, end) = (first / WORDS_PER_SECTOR, (first + words).div_ceil(WORDS_PER_SECTOR));
+    for sector in (start..end).step_by(block::MAX_SECTORS) {
+        let count = (end - sector).min(block::MAX_SECTORS);
+        if volume().read(sector as u64, &mut bytes[..count * SECTOR]).is_ok() {
+            let words = &mut mirror()[sector * WORDS_PER_SECTOR..(sector + count) * WORDS_PER_SECTOR];
+            for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+                *word = u32::from_le_bytes(chunk.try_into().unwrap());
+            }
+        }
+    }
+}
+
+/// Reads the whole partition into the mirror, or says it can't.
+fn open_disk() -> bool {
+    // SAFETY: the loader mapped the channel shared with the volume read/write at VOLUME_VADDR.
+    let client = Client { channel: unsafe { Channel::new(VOLUME_CPTR, VOLUME_VADDR as *mut u8) } };
+    // SAFETY: as `volume`: nothing else uses it yet.
+    unsafe { *DISK.0.get() = Some(client) };
+    if volume().sectors().map_or(true, |n| (n as usize) < MIRROR_BYTES / SECTOR) {
+        return false;
+    }
+    let mut bytes = [0u8; block::MAX_BYTES];
+    for (i, words) in mirror().chunks_mut(block::MAX_BYTES / 4).enumerate() {
+        if volume().read((i * block::MAX_SECTORS) as u64, &mut bytes).is_err() {
+            return false;
+        }
+        for (word, chunk) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+            *word = u32::from_le_bytes(chunk.try_into().unwrap());
+        }
+    }
+    ON_DISK_MODE.store(true, Ordering::Relaxed);
+    true
+}
+
+/// Flash, or the disk's partition, whichever this program was launched with.
+struct AnyFlash;
+
+impl Flash for AnyFlash {
+    fn read(&self, word: usize) -> u32 {
+        if ON_DISK_MODE.load(Ordering::Relaxed) {
+            mirror()[word]
+        } else {
+            MappedFlash.read(word)
+        }
+    }
+
+    fn program(&mut self, word: usize, value: u32) {
+        if ON_DISK_MODE.load(Ordering::Relaxed) {
+            // A program the disk didn't take didn't happen: the log reads every one back, and must see that.
+            let old = mirror()[word];
+            mirror()[word] = old & value;
+            if !write_through(word, 1) {
+                mirror()[word] = old;
+            }
+        } else {
+            MappedFlash.program(word, value)
+        }
+    }
+
+    fn erase_sector(&mut self, first: usize, words: usize) {
+        if ON_DISK_MODE.load(Ordering::Relaxed) {
+            mirror()[first..first + words].fill(u32::MAX);
+            if !write_through(first, words) {
+                reload(first, words);
+            }
+        } else {
+            MappedFlash.erase_sector(first, words)
+        }
+    }
+}
+
 lantern_abi::entry!(run);
 
-fn run(quota: usize) -> ! {
+fn run(arg0: usize) -> ! {
     lantern_abi::rt::report_panics_via(FAILURE_CPTR);
-    let mut log = Log::open(MappedFlash);
-    let mut audit = AuditLog::open(MappedFlash);
-    let mut decisions = Decisions::open(MappedFlash);
+    if arg0 & ON_DISK != 0 && !open_disk() {
+        panic!("policy-store: the disk's policy partition can't be read");
+    }
+    let quota = arg0 & 0xffff;
+    let mut log = Log::open(AnyFlash);
+    let mut audit = AuditLog::open(AnyFlash);
+    let mut decisions = Decisions::open(AnyFlash);
     let limit = if quota == 0 { policy::USE_QUOTA } else { (quota as u32).min(policy::USE_QUOTA) };
     let mut quota = Quota::<QUOTA_GRANTS>::new(limit);
     loop {
@@ -168,7 +305,7 @@ fn run(quota: usize) -> ! {
 
 /// An `APPEND` from `source`: `OK` only once it's on flash. The events a source may not append are refused,
 /// which includes the store's own `BOOT`, `QUOTA_REACHED` and `RETIRED`.
-fn append(audit: &mut AuditLog<MappedFlash>, source: Source, entry: AuditEntry) -> u16 {
+fn append(audit: &mut AuditLog<AnyFlash>, source: Source, entry: AuditEntry) -> u16 {
     if !source.may_append(entry.event) {
         status::ACCESS
     } else if audit.append(&entry).is_ok() {
@@ -179,7 +316,7 @@ fn append(audit: &mut AuditLog<MappedFlash>, source: Source, entry: AuditEntry) 
 }
 
 /// `HEAD`, `OLDEST` and `READ`, and nothing else, for the read-only badge.
-fn serve_reader(audit: &AuditLog<MappedFlash>, op: u32, index: u64) -> Result<(), lantern_abi::wire::SyscallError> {
+fn serve_reader(audit: &AuditLog<AnyFlash>, op: u32, index: u64) -> Result<(), lantern_abi::wire::SyscallError> {
     match op {
         policy::OP_HEAD => match audit.head() {
             Ok(head) => policy::reply_head(status::OK, head.count, head.head),

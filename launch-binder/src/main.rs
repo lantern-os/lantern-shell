@@ -96,12 +96,43 @@ const CONSENT_VADDR: usize = 0x9000_0000;
 /// Must equal `lantern_boot::launch::HEAP_VADDR`, sized by the loader's `heap_megapages`.
 const HEAP_BASE: usize = 0x8620_0000;
 const HEAP_LEN: usize = 0x20_0000;
-/// Must equal `lantern_boot::launch::PACKAGE_VADDR`; the exact length arrives in `arg0`. With a launcher, the package
-/// set is there instead (`launcher::SET_VADDR`), and `arg0` carries how many packages it holds.
+/// Must equal `lantern_boot::launch::PACKAGE_VADDR`; the exact length arrives in `arg0`. With a launcher, the packages
+/// are read from the disk into Frames mapped there instead (`launcher::SET_VADDR`).
 const PACKAGE_VADDR: usize = 0x8c00_0000;
 const PACKAGE_MAX_LEN: usize = 0x20_0000;
 
 lantern_abi::entry!(run);
+
+/// RFC-0031, with a launcher: the volume, under its `BINDER` badge; this program's own VSpace; and the Frames it reads the
+/// disk's packages into, mapped at `launcher::SET_VADDR`. It reads them itself, and trusts neither the disk nor the
+/// launcher: each package is verified before anything is parsed.
+const VOLUME_CPTR: usize = 16;
+const SELF_VSPACE_CPTR: usize = 17;
+const SET_FRAMES_CPTR: usize = 20;
+const SET_FRAME_COUNT: usize = 4;
+const VOLUME_VADDR: usize = 0x9001_0000;
+
+fn volume() -> lantern_abi::block::Client {
+    // SAFETY: with a launcher, the loader mapped the channel shared with the volume read/write at VOLUME_VADDR.
+    lantern_abi::block::Client { channel: unsafe { lantern_abi::frame::Channel::new(VOLUME_CPTR, VOLUME_VADDR as *mut u8) } }
+}
+
+fn map_set_frames() -> Vec<&'static mut [u8]> {
+    use lantern_abi::wire::MapPerms;
+    let rw = MapPerms::READ.union(MapPerms::WRITE).union(MapPerms::USER);
+    (0..SET_FRAME_COUNT)
+        .take_while(|&i| {
+            let vaddr = launcher::SET_VADDR + i * launcher::SET_STRIDE;
+            sys::frame::map(SET_FRAMES_CPTR + i, SELF_VSPACE_CPTR, vaddr, rw).is_ok()
+        })
+        .map(|i| {
+            // SAFETY: Frame `i` was just mapped read/write here, one per stride, and nothing else maps it.
+            unsafe {
+                core::slice::from_raw_parts_mut((launcher::SET_VADDR + i * launcher::SET_STRIDE) as *mut u8, launcher::SET_STRIDE)
+            }
+        })
+        .collect()
+}
 
 /// Text for the shell, written into the consent `Frame`.
 struct ConsentFrame;
@@ -135,16 +166,9 @@ fn run(arg0: usize) -> ! {
 
     let with_launcher = arg0 & grant::WITH_LAUNCHER != 0;
     let packages: Vec<Package> = if with_launcher {
-        (0..package_len.min(launcher::SET_MAX))
-            .map(|i| {
-                // SAFETY: with a launcher, the loader mapped `package_len` set Frames read-only, consecutively, at
-                // `SET_VADDR` for this program's whole life, and nothing maps over them.
-                let frame = unsafe {
-                    core::slice::from_raw_parts((launcher::SET_VADDR + i * launcher::SET_STRIDE) as *const u8, launcher::SET_STRIDE)
-                };
-                launcher::set_entry(frame).and_then(|lpkg| read_package(lpkg, TRUSTED_PUBLISHERS))
-            })
-            .collect()
+        let mut frames = map_set_frames();
+        let count = lantern_abi::block::packages::load(&mut volume(), &mut frames);
+        frames[..count].iter().map(|frame| launcher::set_entry(frame).and_then(|lpkg| read_package(lpkg, TRUSTED_PUBLISHERS))).collect()
     } else {
         let package = (package_len <= PACKAGE_MAX_LEN)
             .then(|| {
@@ -465,4 +489,5 @@ fn list_decision(packages: &[Package], index: usize) -> [usize; 2] {
 }
 
 const _: () = assert!(SHELL_CANCELLED_CPTR < 32);
+const _: () = assert!(SET_FRAMES_CPTR + SET_FRAME_COUNT <= APP_GRANT_CPTR_BASE && SELF_CNODE_CPTR < VOLUME_CPTR);
 const _: () = assert!(SELF_CNODE_CPTR < APP_GRANT_CPTR_BASE && APP_GRANT_CPTR_BASE + lantern_launch_binder::LEDGER_LEN <= 72);

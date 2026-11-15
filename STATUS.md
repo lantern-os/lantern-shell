@@ -68,6 +68,13 @@
   - **The shell** gains `apps` and `run NAME`, through a page it shares with the launcher, and says when each app ends.
   - **Tests:** 4 launcher tests, 25 binder tests, 7 shell tests. `lantern-boot`'s `console-matrix.sh` now has 21 cases,
     and every app is started with `run`.
+- **Packages from the disk (2026-11-14, [RFC-0031](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md)/[ADR-0036](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0036-storage-a-block-driver-and-the-store-on-disk.md)).** With a launcher, the launcher and the binder each read the disk's
+  packages partition through the volume, into 4 Frames of their own, and verify every package themselves. Neither trusts
+  the disk or the other.
+- **The policy store on a disk (2026-11-14, [RFC-0032](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0032-installing-a-bootable-disk.md)/[ADR-0037](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0037-installing-a-bootable-disk.md)).** With `ON_DISK`, `policy-store` keeps its log on the disk's policy
+  partition. It mirrors the partition in memory, and writes each program or erase through, a sector at a time, before
+  returning. A write the disk refused is undone in the mirror, so the log's own read-back sees it fail. The format is
+  unchanged, so `audit-dump` reads the partition. Without `ON_DISK` (the demos), it's still on flash.
 ## Next
 - A person-set consent limit and a visible countdown; and scoped, time-bounded grants with standard capability shapes, so
   prompts say what they mean (SH2).
