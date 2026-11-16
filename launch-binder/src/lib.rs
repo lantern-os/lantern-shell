@@ -12,7 +12,7 @@
 extern crate alloc;
 
 use lantern_abi::frame::status;
-use lantern_abi::grant::{ListedGrant, APP_SLOTS, INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
+use lantern_abi::grant::{ListedGrant, APP_SLOTS, INTERFACE_FILESYSTEM, INTERFACE_IDENTITY, INTERFACE_INFERENCE, INTERFACE_KEYSTORE};
 use lantern_abi::policy::{reason, RevocationKey};
 use lantern_crypto::KeyOps;
 use lantern_filesystem::FileOps;
@@ -40,11 +40,27 @@ pub const OTHER_DEMO_PUBLISHER: PublisherKey = [
 /// Whose packages this binder will read at all.
 pub const TRUSTED_PUBLISHERS: &[PublisherKey] = &[DEMO_PUBLISHER, OTHER_DEMO_PUBLISHER];
 
+/// [RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md): the principal a verified package's
+/// grants are made for, what the store records with every write they make. 48 bits of BLAKE3 over its publisher key and
+/// app name, never 0, which means none.
+pub fn principal(publisher: &PublisherKey, app: &str) -> u64 {
+    let mut hasher = lantern_crypto::hash::Hasher::new();
+    hasher.update(b"lantern-principal-v1").update(publisher).update(app.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 8];
+    bytes[..6].copy_from_slice(&digest.as_bytes()[..6]);
+    u64::from_le_bytes(bytes).max(1)
+}
+
 /// A host interface a role belongs to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Interface {
     Keystore,
     Filesystem,
+    /// [RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md): the language model.
+    Inference,
+    /// [RFC-0035](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0035-pairwise-network-identities.md): a pairwise network identity.
+    Identity,
 }
 
 impl Interface {
@@ -53,6 +69,8 @@ impl Interface {
         match word {
             INTERFACE_KEYSTORE => Some(Self::Keystore),
             INTERFACE_FILESYSTEM => Some(Self::Filesystem),
+            INTERFACE_INFERENCE => Some(Self::Inference),
+            INTERFACE_IDENTITY => Some(Self::Identity),
             _ => None,
         }
     }
@@ -61,7 +79,21 @@ impl Interface {
         match self {
             Self::Keystore => INTERFACE_KEYSTORE,
             Self::Filesystem => INTERFACE_FILESYSTEM,
+            Self::Inference => INTERFACE_INFERENCE,
+            Self::Identity => INTERFACE_IDENTITY,
         }
+    }
+
+    pub const ALL: [Interface; 4] = [Interface::Keystore, Interface::Filesystem, Interface::Inference, Interface::Identity];
+}
+
+/// `plan`'s requests on `interface`, in `open(slot)` order.
+fn requests(plan: &GrantPlan, interface: Interface) -> &[ResourceRequest] {
+    match interface {
+        Interface::Keystore => &plan.keystore,
+        Interface::Filesystem => &plan.filesystem,
+        Interface::Inference => &plan.inference,
+        Interface::Identity => &plan.identity,
     }
 }
 
@@ -72,9 +104,9 @@ pub struct PolicyEntry {
     pub app: &'static str,
     pub interface: Interface,
     pub role: &'static str,
-    /// The `KeyId` or `FileId`, raw. The service holding it is implied by `interface`.
+    /// The `KeyId` or `FileId`, raw, 0 for the model, or a context's id (`lantern_abi::identity::CONTEXTS`). The service holding it is implied by `interface`.
     pub object: u16,
-    /// `KeyOps` or `FileOps` bits.
+    /// `KeyOps`, `FileOps` or `lantern_abi::inference` op bits.
     pub approved_ops: u8,
 }
 
@@ -95,6 +127,49 @@ pub const POLICY: &[PolicyEntry] = &[
         role: "scratch",
         object: 0,
         approved_ops: FileOps::READ.union(FileOps::WRITE).bits(),
+    },
+    // RFC-0034's file assistant: it reads file 1, which a person writes at the console, asks the model to continue it,
+    // and writes the continuation to file 2. Nothing else.
+    PolicyEntry {
+        publisher: DEMO_PUBLISHER,
+        app: "file-assistant",
+        interface: Interface::Filesystem,
+        role: "input",
+        object: 1,
+        approved_ops: FileOps::READ.bits(),
+    },
+    PolicyEntry {
+        publisher: DEMO_PUBLISHER,
+        app: "file-assistant",
+        interface: Interface::Filesystem,
+        role: "output",
+        object: 2,
+        approved_ops: FileOps::WRITE.bits(),
+    },
+    PolicyEntry {
+        publisher: DEMO_PUBLISHER,
+        app: "file-assistant",
+        interface: Interface::Inference,
+        role: "writer",
+        object: 0,
+        approved_ops: lantern_abi::inference::GENERATE,
+    },
+    // RFC-0035's greeter: it says hello to alice.test and to bob.test, as a different identity to each.
+    PolicyEntry {
+        publisher: DEMO_PUBLISHER,
+        app: "greeter",
+        interface: Interface::Identity,
+        role: "alice",
+        object: 1,
+        approved_ops: lantern_abi::identity::CONNECT,
+    },
+    PolicyEntry {
+        publisher: DEMO_PUBLISHER,
+        app: "greeter",
+        interface: Interface::Identity,
+        role: "bob",
+        object: 2,
+        approved_ops: lantern_abi::identity::CONNECT,
     },
 ];
 
@@ -131,11 +206,7 @@ pub fn decide(
     if slot > u8::MAX as usize {
         return Err(reason::NOT_DECLARED);
     }
-    let requests = match interface {
-        Interface::Keystore => &plan.keystore,
-        Interface::Filesystem => &plan.filesystem,
-    };
-    let request = requests.get(slot).ok_or(reason::NOT_DECLARED)?;
+    let request = requests(plan, interface).get(slot).ok_or(reason::NOT_DECLARED)?;
     let entry = policy
         .iter()
         .find(|entry| {
@@ -152,11 +223,7 @@ pub fn decide(
 /// What a revocation of this role means, for the policy store ([RFC-0022](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0022-persistent-revocation-store.md)):
 /// the same across boots, unlike a ledger index or a badge. `None` if the plan has no such slot.
 pub fn revocation_key(publisher: &PublisherKey, plan: &GrantPlan, interface: Interface, slot: usize) -> Option<RevocationKey> {
-    let requests = match interface {
-        Interface::Keystore => &plan.keystore,
-        Interface::Filesystem => &plan.filesystem,
-    };
-    Some(key_for(publisher, &plan.app.name, interface, &requests.get(slot)?.role))
+    Some(key_for(publisher, &plan.app.name, interface, &requests(plan, interface).get(slot)?.role))
 }
 
 /// Lengths keep `("ab", "c")` and `("a", "bc")` apart.
@@ -191,6 +258,8 @@ fn op_bit(interface: Interface, op: &str) -> Option<u8> {
         (Interface::Keystore, "sign") => Some(KeyOps::SIGN.bits()),
         (Interface::Filesystem, "read") => Some(FileOps::READ.bits()),
         (Interface::Filesystem, "write") => Some(FileOps::WRITE.bits()),
+        (Interface::Inference, "generate") => Some(lantern_abi::inference::GENERATE),
+        (Interface::Identity, "connect") => Some(lantern_abi::identity::CONNECT),
         _ => None,
     }
 }
@@ -233,20 +302,13 @@ pub fn outcome(answer: Option<lantern_abi::consent::Answer>) -> (Result<u8, u8>,
 
 /// The request at `(interface, slot)` in `plan`: its role, ops and justification.
 pub fn request(plan: &GrantPlan, interface: Interface, slot: usize) -> Option<&ResourceRequest> {
-    match interface {
-        Interface::Keystore => plan.keystore.get(slot),
-        Interface::Filesystem => plan.filesystem.get(slot),
-    }
+    requests(plan, interface).get(slot)
 }
 
 /// Which of `plan`'s requests a revocation key names, if any: for naming a remembered decision on the console.
 pub fn role_for_key<'a>(publisher: &PublisherKey, plan: &'a GrantPlan, key: RevocationKey) -> Option<&'a ResourceRequest> {
-    [Interface::Keystore, Interface::Filesystem].into_iter().find_map(|interface| {
-        let requests = match interface {
-            Interface::Keystore => &plan.keystore,
-            Interface::Filesystem => &plan.filesystem,
-        };
-        requests.iter().find(|r| key_for(publisher, &plan.app.name, interface, &r.role) == key)
+    Interface::ALL.into_iter().find_map(|interface| {
+        requests(plan, interface).iter().find(|r| key_for(publisher, &plan.app.name, interface, &r.role) == key)
     })
 }
 
@@ -410,6 +472,15 @@ impl Ledger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_principal_is_48_bits_and_differs_by_publisher_and_by_app() {
+        let p = principal(&DEMO_PUBLISHER, "confined-fs-probe");
+        assert!(p != 0 && p >> 48 == 0);
+        assert_eq!(p, principal(&DEMO_PUBLISHER, "confined-fs-probe"), "the same package, the same principal");
+        assert_ne!(p, principal(&OTHER_DEMO_PUBLISHER, "confined-fs-probe"), "another publisher can't claim it");
+        assert_ne!(p, principal(&DEMO_PUBLISHER, "confined-probe"));
+    }
 
     #[test]
     fn a_registration_names_only_a_verified_package_in_a_free_slot() {
@@ -676,7 +747,52 @@ mod tests {
     #[test]
     fn unknown_interface_words_are_not_interfaces() {
         assert_eq!(Interface::from_wire(INTERFACE_KEYSTORE), Some(Interface::Keystore));
+        assert_eq!(Interface::from_wire(INTERFACE_INFERENCE), Some(Interface::Inference));
+        assert_eq!(Interface::from_wire(INTERFACE_IDENTITY), Some(Interface::Identity));
         assert_eq!(Interface::from_wire(0), None);
-        assert_eq!(Interface::from_wire(3), None);
+        assert_eq!(Interface::from_wire(5), None);
+        for interface in Interface::ALL {
+            assert_eq!(Interface::from_wire(interface.to_wire()), Some(interface));
+        }
+    }
+
+    #[test]
+    fn the_file_assistant_gets_its_two_files_and_the_model_and_nothing_more() {
+        let src = "[app]\nname = \"file-assistant\"\nversion = \"0.1.0\"\n\
+                   [[filesystem.file]]\nrole = \"input\"\nops = [\"read\"]\njustification = \"x\"\n\
+                   [[filesystem.file]]\nrole = \"output\"\nops = [\"write\"]\njustification = \"x\"\n\
+                   [[inference.model]]\nrole = \"writer\"\nops = [\"generate\"]\njustification = \"x\"\n";
+        let plan = lantern_sdk::parse(src).unwrap().plan();
+        let publisher = DEMO_PUBLISHER;
+        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Filesystem, 0), Ok(Binding { object: 1, ops: FileOps::READ.bits() }));
+        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Filesystem, 1), Ok(Binding { object: 2, ops: FileOps::WRITE.bits() }));
+        assert_eq!(
+            decide(&publisher, &plan, POLICY, Interface::Inference, 0),
+            Ok(Binding { object: 0, ops: lantern_abi::inference::GENERATE })
+        );
+        assert_eq!(decide(&OTHER_DEMO_PUBLISHER, &plan, POLICY, Interface::Inference, 0), Err(reason::NOT_IN_POLICY));
+        // Asking to write its input is beyond the policy, and so declined, not narrowed.
+        let greedy = src.replace("ops = [\"read\"]", "ops = [\"read\", \"write\"]");
+        let plan = lantern_sdk::parse(&greedy).unwrap().plan();
+        assert_eq!(decide(&publisher, &plan, POLICY, Interface::Filesystem, 0), Err(reason::OPS_EXCEED_POLICY));
+        let key = revocation_key(&publisher, &plan, Interface::Inference, 0).unwrap();
+        assert_eq!(role_for_key(&publisher, &plan, key).map(|r| r.role.as_str()), Some("writer"));
+    }
+
+    #[test]
+    fn the_greeter_gets_its_two_peers_and_no_other() {
+        let src = "[app]\nname = \"greeter\"\nversion = \"0.1.0\"\n\
+                   [[identity.context]]\nrole = \"alice\"\nops = [\"connect\"]\njustification = \"x\"\n\
+                   [[identity.context]]\nrole = \"bob\"\nops = [\"connect\"]\njustification = \"x\"\n\
+                   [[identity.context]]\nrole = \"carol\"\nops = [\"connect\"]\njustification = \"x\"\n";
+        let plan = lantern_sdk::parse(src).unwrap().plan();
+        let c = lantern_abi::identity::CONNECT;
+        assert_eq!(decide(&DEMO_PUBLISHER, &plan, POLICY, Interface::Identity, 0), Ok(Binding { object: 1, ops: c }));
+        assert_eq!(decide(&DEMO_PUBLISHER, &plan, POLICY, Interface::Identity, 1), Ok(Binding { object: 2, ops: c }));
+        assert_eq!(decide(&DEMO_PUBLISHER, &plan, POLICY, Interface::Identity, 2), Err(reason::NOT_IN_POLICY));
+        assert_eq!(decide(&OTHER_DEMO_PUBLISHER, &plan, POLICY, Interface::Identity, 0), Err(reason::NOT_IN_POLICY));
+        for entry in POLICY.iter().filter(|e| e.interface == Interface::Identity) {
+            assert!(lantern_abi::identity::context(entry.object).is_some(), "every context the policy names exists");
+        }
     }
 }

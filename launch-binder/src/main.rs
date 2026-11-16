@@ -51,8 +51,8 @@ use alloc::vec::Vec;
 use lantern_abi::consent::{self, Answer, Ask};
 use lantern_abi::frame::status;
 use lantern_abi::grant::{
-    self, ListedDecision, CONTROL_BADGE, CONTROL_DECISIONS, CONTROL_FORGET, CONTROL_LIST, CONTROL_REVOKE, REGISTER, REGISTER_BADGE,
-    UNREGISTER,
+    self, ListedDecision, CONTROL_BADGE, CONTROL_DECISIONS, CONTROL_FORGET, CONTROL_LIST, CONTROL_PRINCIPAL, CONTROL_REVOKE, REGISTER,
+    REGISTER_BADGE, UNREGISTER,
 };
 use lantern_abi::launcher;
 use lantern_abi::policy::{decision, event, reason, AuditEntry};
@@ -108,6 +108,11 @@ lantern_abi::entry!(run);
 /// launcher: each package is verified before anything is parsed.
 const VOLUME_CPTR: usize = 16;
 const SELF_VSPACE_CPTR: usize = 17;
+/// [RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md): the inference service's endpoint
+/// under `GRANTER_BADGE`. Empty in an image without one, which declines the interface.
+const INFERENCE_GRANTER_CPTR: usize = 18;
+/// [RFC-0035](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0035-pairwise-network-identities.md): the wallet's endpoint under `GRANTER_BADGE`.
+const WALLET_GRANTER_CPTR: usize = 19;
 const SET_FRAMES_CPTR: usize = 20;
 const SET_FRAME_COUNT: usize = 4;
 const VOLUME_VADDR: usize = 0x9001_0000;
@@ -278,7 +283,9 @@ fn bind(package: &Package, consent: Option<Consent>, ledger: &mut Ledger, reques
         let dest = grant_cptr(app, index);
         // With a launcher, the service ties the badge to this app slot's channel, and serves it there only.
         let ops = grant::grant_ops(binding.ops, app);
-        match grant::request_grant(granter(interface), dest, binding.object as usize, ops) {
+        // RFC-0033: the service records who every write under this grant is from: this package, as verified here.
+        let object = lantern_abi::provenance::grant_object(binding.object, lantern_launch_binder::principal(publisher, &plan.app.name));
+        match grant::request_grant(granter(interface), dest, object, ops) {
             Ok((status::OK, badge)) => {
                 // `decide` refuses a slot that doesn't fit.
                 ledger.record(index, interface, slot as u8, binding, badge, entry.subject, package_index);
@@ -368,6 +375,8 @@ fn granter(interface: Interface) -> usize {
     match interface {
         Interface::Keystore => KEYSTORE_GRANTER_CPTR,
         Interface::Filesystem => STORE_GRANTER_CPTR,
+        Interface::Inference => INFERENCE_GRANTER_CPTR,
+        Interface::Identity => WALLET_GRANTER_CPTR,
     }
 }
 
@@ -421,6 +430,20 @@ fn serve_control(
             entry.listed().to_words()
         }
         (CONTROL_DECISIONS, _) if with_consent => list_decision(packages, index),
+        (CONTROL_PRINCIPAL, _) => {
+            let named = packages.iter().flatten().find(|(publisher, plan)| lantern_launch_binder::principal(publisher, &plan.app.name) == index as u64);
+            match named {
+                Some((publisher, plan)) => {
+                    if with_consent {
+                        ConsentFrame::names(plan.app.name.as_bytes(), b"");
+                    }
+                    // The publisher as the console shows it: its first 4 bytes and its last 2.
+                    let shown = u64::from_be_bytes([0, 0, publisher[0], publisher[1], publisher[2], publisher[3], publisher[30], publisher[31]]);
+                    [status::OK as usize, shown as usize]
+                }
+                None => [status::INVALID as usize, 0],
+            }
+        }
         (CONTROL_FORGET, _) if with_consent => {
             let forgot = match policy::decision_read(POLICY_STORE_CPTR, index) {
                 Ok((status::OK, _, _, key)) => {

@@ -75,6 +75,19 @@
   partition. It mirrors the partition in memory, and writes each program or erase through, a sector at a time, before
   returning. A write the disk refused is undone in the mirror, so the log's own read-back sees it fail. The format is
   unchanged, so `audit-dump` reads the partition. Without `ON_DISK` (the demos), it's still on flash.
+- **Provenance (2026-11-15, [RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md)/[ADR-0038](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0038-provenance-for-data-at-rest.md)).** The binder computes each verified package's principal, sends it with every grant,
+  and names one for the shell (`CONTROL_PRINCIPAL`). The shell's new `files` command lists each file's size and writers,
+  through the store's metadata-only reader badge. 26 binder tests, 7 shell tests.
+- **Local inference and a file assistant (2026-11-16, [RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md)/[ADR-0039](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0039-local-inference-and-a-file-assistant.md)).** The binder knows a third interface, the language model,
+  with one op, `generate`, and its policy allows the file assistant its two files and the model as a ceiling; the inference
+  service's granter is its slot 18. The launcher maps a channel for each interface an app asks for. The shell names the
+  model in prompts, listings and the audit log (with the model's digest prefix, the tokens asked for and the prompt's
+  length), and gains `write N TEXT` and `read N`, a person's own access to their files, recorded as theirs. A file's text
+  is shown as printable ASCII, so no file can send the terminal a control sequence. 27 binder tests, 4 launcher, 8 shell.
+- **Network identities (2026-11-16, [RFC-0035](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0035-pairwise-network-identities.md)/[ADR-0040](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0040-pairwise-network-identities.md)).** The binder knows the identity interface (op `connect`, its granter at slot 19),
+  and its policy allows the greeter alice.test and bob.test. The launcher maps a channel to the wallet for an app that
+  asks. The shell names identities in prompts and the audit log (peer, key prefix, length), and `identities` lists each
+  one presented. 28 binder tests.
 ## Next
 - A person-set consent limit and a visible countdown; and scoped, time-bounded grants with standard capability shapes, so
   prompts say what they mean (SH2).

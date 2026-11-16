@@ -11,8 +11,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use lantern_abi::elf;
-use lantern_abi::grant::{APP_SLOTS, INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
-use lantern_abi::launcher::outcome;
+use lantern_abi::grant::{APP_SLOTS, INTERFACE_FILESYSTEM, INTERFACE_IDENTITY, INTERFACE_INFERENCE, INTERFACE_KEYSTORE};
+use lantern_abi::launcher::{interface_bit, outcome, Interfaces};
 use lantern_launch_binder::{read_package, TRUSTED_PUBLISHERS};
 
 /// One verified package in the set, as `apps` lists it.
@@ -23,9 +23,10 @@ pub struct Entry {
     pub name: String,
     /// The first justification it gives, if any.
     pub description: String,
-    /// The one host interface it asks for, which decides the channel it gets. An app the runtime can't host (both, or
-    /// neither) isn't listed.
-    pub interface: usize,
+    /// The host interfaces it asks for (`lantern_abi::launcher::interface_bit`s), which decide the channels it gets
+    /// ([RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md)). An app asking for none isn't
+    /// listed.
+    pub interfaces: Interfaces,
     pub len: usize,
 }
 
@@ -44,14 +45,32 @@ impl Catalog {
             .filter_map(|(index, lpkg)| {
                 let lpkg = lpkg?;
                 let (_, plan) = read_package(lpkg, TRUSTED_PUBLISHERS)?;
-                let interface = match (plan.keystore.is_empty(), plan.filesystem.is_empty()) {
-                    (false, true) => INTERFACE_KEYSTORE,
-                    (true, false) => INTERFACE_FILESYSTEM,
-                    _ => return None,
-                };
-                let description =
-                    plan.keystore.iter().chain(&plan.filesystem).next().map(|r| r.justification.clone()).unwrap_or_default();
-                Some(Entry { index, name: plan.app.name, description, interface, len: lpkg.len() })
+                let mut interfaces = 0;
+                for (requests, interface) in
+                    [
+                        (&plan.keystore, INTERFACE_KEYSTORE),
+                        (&plan.filesystem, INTERFACE_FILESYSTEM),
+                        (&plan.inference, INTERFACE_INFERENCE),
+                        (&plan.identity, INTERFACE_IDENTITY),
+                    ]
+                {
+                    if !requests.is_empty() {
+                        interfaces |= interface_bit(interface);
+                    }
+                }
+                if interfaces == 0 {
+                    return None;
+                }
+                let description = plan
+                    .keystore
+                    .iter()
+                    .chain(&plan.filesystem)
+                    .chain(&plan.inference)
+                    .chain(&plan.identity)
+                    .next()
+                    .map(|r| r.justification.clone())
+                    .unwrap_or_default();
+                Some(Entry { index, name: plan.app.name, description, interfaces, len: lpkg.len() })
             })
             .collect();
         Self { entries }
@@ -173,7 +192,7 @@ mod tests {
         let catalog = Catalog::new([Some(&untrusted[..]), Some(&good[..]), None, Some(&tampered[..])]);
         assert_eq!(catalog.entries.len(), 1);
         let entry = catalog.find(b"confined-fs-probe").unwrap();
-        assert_eq!((entry.index, entry.interface, entry.description.as_str()), (1, INTERFACE_FILESYSTEM, "says why"));
+        assert_eq!((entry.index, entry.interfaces, entry.description.as_str()), (1, interface_bit(INTERFACE_FILESYSTEM), "says why"));
         assert_eq!(catalog.find(b"evil"), None);
         assert_eq!(catalog.find(b"tampered"), None);
     }
