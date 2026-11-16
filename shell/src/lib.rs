@@ -12,7 +12,7 @@
 use core::fmt::{self, Write};
 
 use lantern_abi::consent::{Answer, Ask};
-use lantern_abi::grant::{INTERFACE_FILESYSTEM, INTERFACE_KEYSTORE};
+use lantern_abi::grant::{INTERFACE_FILESYSTEM, INTERFACE_IDENTITY, INTERFACE_INFERENCE, INTERFACE_KEYSTORE};
 
 /// App-supplied text, made safe to print: printable ASCII passes, and every other byte, `"` and `\` included, becomes
 /// `?`.
@@ -20,6 +20,20 @@ pub struct Sanitized<'a>(pub &'a [u8]);
 
 pub fn sanitized(text: &[u8]) -> Sanitized<'_> {
     Sanitized(text)
+}
+
+/// A file's text, for `read` ([RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md)):
+/// printable ASCII as it is, quotes included, since it's shown indented and never inside quotes, and anything else as `?`,
+/// so no file, whatever wrote it, can send the terminal a control sequence.
+pub struct Text<'a>(pub &'a [u8]);
+
+impl fmt::Display for Text<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for &byte in self.0 {
+            f.write_char(if matches!(byte, 0x20..=0x7e) { byte as char } else { '?' })?;
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for Sanitized<'_> {
@@ -37,6 +51,8 @@ pub fn interface_name(interface: u8) -> &'static str {
     match interface as usize {
         INTERFACE_KEYSTORE => "keystore",
         INTERFACE_FILESYSTEM => "filesystem",
+        INTERFACE_INFERENCE => "the language model",
+        INTERFACE_IDENTITY => "a network identity",
         _ => "unknown",
     }
 }
@@ -53,6 +69,12 @@ impl fmt::Display for Ops {
         let names: &[(u8, &str)] = match self.interface as usize {
             INTERFACE_KEYSTORE => &[(1, "encrypt"), (2, "decrypt"), (4, "sign")],
             INTERFACE_FILESYSTEM => &[(1, "read"), (2, "write")],
+            INTERFACE_INFERENCE => &[(lantern_abi::inference::GENERATE, "generate")],
+            INTERFACE_IDENTITY => &[
+                (lantern_abi::identity::CONNECT, "connect"),
+                (lantern_abi::identity::SEND, "send"),
+                (lantern_abi::identity::RECV, "receive"),
+            ],
             _ => &[],
         };
         let mut first = true;
@@ -122,6 +144,16 @@ pub enum Command<'a> {
     /// Start the app with this name: printable, no spaces, at most `launcher::NAME_MAX` bytes.
     Run(&'a [u8]),
     Grants,
+    /// Each file's size and who wrote it ([RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md)).
+    Files,
+    /// Replace file N's content with this text, as the person at the console
+    /// ([RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md)).
+    Write(usize, &'a [u8]),
+    /// File N's content, shown to the person at the console.
+    Read(usize),
+    /// Each identity the wallet has presented, to whom, for which app
+    /// ([RFC-0035](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0035-pairwise-network-identities.md)).
+    Identities,
     Revoke(usize),
     Audit(usize),
     Decisions,
@@ -138,6 +170,13 @@ pub fn parse_command(line: &[u8]) -> Command<'_> {
     let mut words = line.split(|&b| b == b' ').filter(|w| !w.is_empty());
     let Some(word) = words.next() else { return Command::Empty };
     let argument = words.next();
+    if word == b"write" {
+        // The text is the rest of the line, spaces and all, after the file's number and one space.
+        let Some(Some(file)) = argument.map(parse_number) else { return Command::Unknown };
+        let at = line.windows(argument.unwrap().len()).position(|w| Some(w) == argument).unwrap() + argument.unwrap().len();
+        let text = line[at..].strip_prefix(b" ").unwrap_or(&[]);
+        return if text.is_empty() { Command::Unknown } else { Command::Write(file, text) };
+    }
     if words.next().is_some() {
         return Command::Unknown;
     }
@@ -154,6 +193,9 @@ pub fn parse_command(line: &[u8]) -> Command<'_> {
         (b"apps", None) => Command::Apps,
         (b"help", None) => Command::Help,
         (b"grants", None) => Command::Grants,
+        (b"files", None) => Command::Files,
+        (b"read", Some(Some(n))) => Command::Read(n),
+        (b"identities", None) => Command::Identities,
         (b"decisions", None) => Command::Decisions,
         (b"audit", None) => Command::Audit(AUDIT_DEFAULT),
         (b"audit", Some(Some(n))) => Command::Audit(n),
@@ -282,6 +324,10 @@ pub const HELP: &str = "\
   apps         the apps you can run\n\
   run NAME     start an app; it asks for what it needs\n\
   grants       what each app holds now\n\
+  files        each file, and which apps wrote it\n\
+  read N       show file N\n\
+  identities   which identity each app presented to whom\n\
+  write N TEXT replace file N with TEXT, as you\n\
   revoke N     end grant N now; it's asked again next time\n\
   audit [N]    the last N records of the audit log, verified first\n\
   decisions    your remembered \"always\" and \"never\" answers\n\
@@ -295,6 +341,12 @@ mod tests {
 
     fn ask<'a>(app: &'a [u8], role: &'a [u8], justification: &'a [u8]) -> Ask<'a> {
         Ask { interface: INTERFACE_KEYSTORE as u8, ops: 4, publisher: [0x92; 32], app, role, justification, truncated: false }
+    }
+
+    #[test]
+    fn a_files_text_keeps_quotes_but_never_a_control_byte() {
+        let shown = format!("{}", Text(b"Spot said \"hi\".\x1b[2J\x07\xc3\xa9"));
+        assert_eq!(shown, "Spot said \"hi\".?[2J???");
     }
 
     #[test]
@@ -357,6 +409,17 @@ mod tests {
         assert_eq!(parse_command(b"audit 40"), Command::Audit(40));
         assert_eq!(parse_command(b"forget 2"), Command::Forget(2));
         assert_eq!(parse_command(b"apps"), Command::Apps);
+        assert_eq!(parse_command(b"files"), Command::Files);
+        assert_eq!(parse_command(b"files 2"), Command::Unknown);
+        assert_eq!(parse_command(b"write 1 Once upon a time"), Command::Write(1, b"Once upon a time"));
+        assert_eq!(parse_command(b" write 1  two  spaces "), Command::Write(1, b" two  spaces"));
+        assert_eq!(parse_command(b"write 11 1"), Command::Write(11, b"1"));
+        assert_eq!(parse_command(b"read 2"), Command::Read(2));
+        assert_eq!(parse_command(b"identities"), Command::Identities);
+        assert_eq!(parse_command(b"read"), Command::Unknown);
+        for line in [&b"write"[..], b"write 1", b"write x text", b"write 1 "] {
+            assert_eq!(parse_command(line), Command::Unknown, "{:?}", core::str::from_utf8(line));
+        }
         assert_eq!(parse_command(b" run  confined-fs-probe "), Command::Run(b"confined-fs-probe"));
         for line in [&b"run"[..], b"run a b", b"run \x1b[2J", b"apps 1"] {
             assert_eq!(parse_command(line), Command::Unknown, "{line:?}");

@@ -32,6 +32,7 @@ use lantern_abi::frame::status;
 use lantern_abi::grant::{self, APP_SLOTS};
 use lantern_abi::launcher::{self, outcome, shell_bit, OP_LIST, OP_RUN};
 use lantern_abi::policy::{self, decision};
+use lantern_abi::provenance;
 use lantern_abi::sys::{self, irq};
 use lantern_policy_store::audit::chain;
 use lantern_shell::{
@@ -52,6 +53,13 @@ const READER_CPTR: usize = 5;
 const ANSWER_CPTR_BASE: usize = 6;
 /// The launcher's notification, badged `launcher::bit::COMMAND`.
 const LAUNCHER_CPTR: usize = 10;
+/// The store's endpoint under `provenance::STORE_READER_BADGE`: sizes and provenance, never contents.
+const STORE_READER_CPTR: usize = 11;
+/// RFC-0034: the store's endpoint under `provenance::STORE_CONSOLE_BADGE`, for `write`, and its channel.
+const STORE_CONSOLE_CPTR: usize = 12;
+const STORE_CONSOLE_VADDR: usize = 0x9002_0000;
+/// RFC-0035: the wallet's endpoint under `identity::READER_BADGE`: what it presented, never a key.
+const WALLET_READER_CPTR: usize = 13;
 
 /// Must equal the system loader's: the UART's page, and the consent `Frame` shared with the binder.
 const UART_VADDR: usize = 0x9500_0000;
@@ -351,6 +359,38 @@ fn handle_line(out: &mut Console, line: &[u8], state: Prompt, launching: &mut Op
             let _ = out.write_str(HELP);
         }
         Command::Grants => grants(out),
+        Command::Files => files(out),
+        Command::Identities => identities(out),
+        Command::Read(file) => {
+            let mut content = [0u8; 256];
+            match console_read(file, &mut content) {
+                Ok((status::OK, 0)) => {
+                    let _ = writeln!(out, "lantern: file {file} is empty.");
+                }
+                Ok((status::OK, len)) => {
+                    // Whatever wrote it, it's shown as text, never as control sequences: line breaks start an indented
+                    // line, and anything else unprintable is a `?`.
+                    let text = content[..len].strip_suffix(b"\n").unwrap_or(&content[..len]);
+                    for line in text.split(|&b| b == b'\n') {
+                        let _ = writeln!(out, "  {}", lantern_shell::Text(line));
+                    }
+                }
+                Ok(_) => {
+                    let _ = writeln!(out, "lantern: there's no file {file}.");
+                }
+                Err(()) => {
+                    let _ = out.write_str("lantern: the store couldn't be reached.\n");
+                }
+            }
+        }
+        Command::Write(file, text) => {
+            let said = match console_write(file, text) {
+                Ok(status::OK) => "written, as you",
+                Ok(status::INVALID) => "there's no such file, or the text is too long for one",
+                _ => "the store couldn't write it",
+            };
+            let _ = writeln!(out, "lantern: file {file}: {said}.");
+        }
         Command::Revoke(index) => {
             let said = match grant::revoke(CONTROL_CPTR, index) {
                 Ok(status::OK) => "revoked: it ends now, and the app will be asked again next time",
@@ -376,6 +416,117 @@ fn handle_line(out: &mut Console, line: &[u8], state: Prompt, launching: &mut Op
     }
     let _ = out.write_str("> ");
     Prompt::Idle
+}
+
+/// Each file the store holds, its size, and its last writes, newest first, each named by the binder.
+fn files(out: &mut Console) {
+    let mut any = false;
+    for index in 0.. {
+        let info = match provenance::file_info(STORE_READER_CPTR, index) {
+            Ok(Some(info)) => info,
+            Ok(None) => break,
+            Err(_) => {
+                let _ = out.write_str("lantern: the store couldn't be reached.\n");
+                return;
+            }
+        };
+        if !info.exists {
+            continue;
+        }
+        any = true;
+        let state = if info.destroyed { "  (destroyed)" } else { "" };
+        let _ = write!(out, "  file {index}  {} bytes{state}", info.len);
+        if info.entries == 0 {
+            let _ = out.write_str("  never written\n");
+            continue;
+        }
+        for k in 0..info.entries {
+            let Ok(Some(entry)) = provenance::file_entry(STORE_READER_CPTR, index, k) else { break };
+            let _ = out.write_str(if k == 0 { "   written by " } else { "\n          before:        " });
+            writer(out, entry.principal);
+            let _ = write!(out, ", write {}, boot {}", entry.write, entry.boot);
+        }
+        let _ = out.write_str("\n");
+    }
+    if !any {
+        let _ = out.write_str("  no files\n");
+    }
+}
+
+/// `write`: replaces `file`'s content with `text` at the store, which records the console as its writer. A file is one of
+/// the store's blocks, so `text` fits any line the editor takes.
+fn console_write(file: usize, text: &[u8]) -> Result<u16, ()> {
+    let file = u16::try_from(file).map_err(|_| ())?;
+    let mut request = [0u8; 2 + LINE_MAX];
+    let len = provenance::encode_console_write(file, text, &mut request).ok_or(())?;
+    // SAFETY: the loader mapped the channel shared with the store read/write at STORE_CONSOLE_VADDR, this program's only
+    // use of it, and nothing else here holds a `Channel` over it.
+    let mut channel = unsafe { lantern_abi::frame::Channel::new(STORE_CONSOLE_CPTR, STORE_CONSOLE_VADDR as *mut u8) };
+    channel.call(provenance::OP_CONSOLE_WRITE, &request[..len], &mut []).map(|(status, _)| status).map_err(|_| ())
+}
+
+/// `read`: file `file`'s content from the store, as the person at the console.
+fn console_read(file: usize, out: &mut [u8]) -> Result<(u16, usize), ()> {
+    let file = u16::try_from(file).map_err(|_| ())?;
+    // SAFETY: as in `console_write`.
+    let mut channel = unsafe { lantern_abi::frame::Channel::new(STORE_CONSOLE_CPTR, STORE_CONSOLE_VADDR as *mut u8) };
+    channel.call(provenance::OP_CONSOLE_READ, &file.to_le_bytes(), out).map_err(|_| ())
+}
+
+/// Each identity the wallet has presented: which app, to which peer, the key's first bytes, and how many sessions.
+fn identities(out: &mut Console) {
+    let mut any = false;
+    for index in 0..64 {
+        let p = match lantern_abi::identity::identity(WALLET_READER_CPTR, index) {
+            Ok(Some(p)) => p,
+            Ok(None) => break,
+            Err(_) => {
+                let _ = out.write_str("lantern: the wallet couldn't be reached.\n");
+                return;
+            }
+        };
+        any = true;
+        let _ = out.write_str("  ");
+        writer(out, p.principal);
+        let peer = lantern_abi::identity::context(p.context).map_or("an unknown peer", |c| c.peer);
+        let s = if p.sessions == 1 { "" } else { "s" };
+        let _ = writeln!(out, " to {peer}: key {:08x}.., {} session{s}", p.key, p.sessions);
+    }
+    if !any {
+        let _ = out.write_str("  none presented yet\n");
+    }
+}
+
+/// Who a principal is, as the binder knows from the packages it verified.
+fn writer(out: &mut Console, principal: u64) {
+    if principal == provenance::NONE {
+        let _ = out.write_str("an unattributed writer");
+        return;
+    }
+    if principal == provenance::CONSOLE {
+        let _ = out.write_str("you, at the console");
+        return;
+    }
+    match grant::principal(CONTROL_CPTR, principal) {
+        Ok(Some(shown)) => {
+            let (app, _) = names();
+            let p = shown.to_be_bytes();
+            let _ = write!(
+                out,
+                "\"{}\" (publisher {:02x}{:02x}{:02x}{:02x}..{:02x}{:02x})",
+                sanitized(app),
+                p[2],
+                p[3],
+                p[4],
+                p[5],
+                p[6],
+                p[7]
+            );
+        }
+        _ => {
+            let _ = write!(out, "an app not on this disk (principal {principal:012x})");
+        }
+    }
 }
 
 fn grants(out: &mut Console) {
@@ -463,6 +614,17 @@ fn audit(out: &mut Console, count: usize) {
             let _ = write!(out, "  #{index:<6} {:<16}", event_name(e.event));
             if e.interface != 0 {
                 let _ = write!(out, " {} {}", interface_name(e.interface), Ops { interface: e.interface, bits: e.ops });
+            }
+            // RFC-0034: which model ran, on how much, for how long; and what the person wrote themselves.
+            if e.event == policy::event::USING && e.interface as usize == grant::INTERFACE_INFERENCE {
+                let (model, tokens, prompt) = lantern_abi::inference::split_audit_subject(e.subject[1]);
+                let _ = write!(out, " (model {model:08x}, up to {tokens} tokens, {prompt}-byte prompt)");
+            } else if e.event == policy::event::USING && e.interface as usize == grant::INTERFACE_IDENTITY {
+                let (key, len) = lantern_abi::identity::split_audit_subject(e.subject[1]);
+                let peer = lantern_abi::identity::context(e.object).map_or("an unknown peer", |c| c.peer);
+                let _ = write!(out, " to {peer} as {key:08x}.. ({len} bytes)");
+            } else if e.event == policy::event::USING && e.subject[0] == provenance::STORE_CONSOLE_BADGE {
+                let _ = write!(out, " file {} (you, at the console)", e.object);
             }
             let _ = writeln!(out, "{}{}", if reason.is_empty() { "" } else { "  " }, reason);
         }

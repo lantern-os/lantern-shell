@@ -33,7 +33,7 @@ use alloc::vec::Vec;
 
 use lantern_abi::block::{self, Client};
 use lantern_abi::frame::Channel;
-use lantern_abi::grant::{self, APP_SLOTS, INTERFACE_KEYSTORE};
+use lantern_abi::grant::{self, APP_SLOTS, INTERFACE_FILESYSTEM, INTERFACE_IDENTITY, INTERFACE_INFERENCE, INTERFACE_KEYSTORE};
 use lantern_abi::launcher::{self, bit, outcome, Command, Reply};
 use lantern_abi::sys::{self, cnode, frame, retype, tcb, untyped};
 use lantern_abi::wire::{MapPerms, Rights};
@@ -53,6 +53,10 @@ const SHELL_ENDED: usize = 11;
 const SHELL_FAILED: usize = 15;
 const KS_CHANNEL: usize = 19;
 const ST_CHANNEL: usize = 23;
+/// RFC-0034: each app slot's channel to the inference service.
+const IN_CHANNEL: usize = 72;
+/// RFC-0035: each app slot's channel to the wallet.
+const ID_CHANNEL: usize = 76;
 /// RFC-0031: the volume, under its `LAUNCHER` badge, and the Frames packages are read into.
 const VOLUME: usize = 66;
 const SET_FRAMES: usize = 67;
@@ -89,7 +93,6 @@ const SMALL_SCRATCH_VADDR: usize = 0x9400_0000;
 const APP_STACK_VADDR: usize = 0x8600_0000;
 const APP_HEAP_VADDR: usize = 0x8620_0000;
 const APP_PACKAGE_VADDR: usize = 0x8c00_0000;
-const APP_FRAME_VADDR: usize = 0x9000_0000;
 const APP_ENDPOINT: usize = 1;
 const APP_SUCCESS: usize = 3;
 const APP_FAILURE: usize = 4;
@@ -260,9 +263,19 @@ fn build(app: usize, entry: &Entry, runtime: &[u8]) -> Result<(), u8> {
     retype::frame_mega(memory, B_PACKAGE).map_err(no_memory)?;
     fill(B_PACKAGE, |dest| dest[..package.len()].copy_from_slice(package))?;
     frame::map(B_PACKAGE, B_VSPACE, APP_PACKAGE_VADDR, MapPerms::READ.union(MapPerms::USER)).map_err(no_memory)?;
-    // The slot's channel for the one interface it asks for, cleared when the last app in this slot ended.
-    let channel = if entry.interface == INTERFACE_KEYSTORE { KS_CHANNEL + app } else { ST_CHANNEL + app };
-    frame::map(channel, B_VSPACE, APP_FRAME_VADDR, rw).map_err(no_memory)?;
+    // The slot's channel for each interface it asks for, where `launcher::channel_vaddr` says, each cleared when the last
+    // app in this slot ended.
+    for (interface, channel) in [
+        (INTERFACE_KEYSTORE, KS_CHANNEL),
+        (INTERFACE_FILESYSTEM, ST_CHANNEL),
+        (INTERFACE_INFERENCE, IN_CHANNEL),
+        (INTERFACE_IDENTITY, ID_CHANNEL),
+    ] {
+        if entry.interfaces & launcher::interface_bit(interface) != 0 {
+            let vaddr = launcher::channel_vaddr(entry.interfaces, interface);
+            frame::map(channel + app, B_VSPACE, vaddr, rw).map_err(no_memory)?;
+        }
+    }
 
     retype::cnode(memory, B_CNODE).map_err(no_memory)?;
     retype::notification(memory, B_PARK).map_err(no_memory)?;
@@ -280,6 +293,7 @@ fn build(app: usize, entry: &Entry, runtime: &[u8]) -> Result<(), u8> {
     retype::sched_context(memory, B_SCHED).map_err(no_memory)?;
     retype::tcb(memory, B_TCB).map_err(no_memory)?;
     tcb::set_fault_notification(B_TCB, FAULT + app).map_err(|_| outcome::FAILED)?;
+    // The runtime finds its channels the same way, from the manifest it verifies itself.
     let arg0 = entry.len | grant::WITH_CONSENT;
     tcb::set_entry(B_TCB, pc, APP_STACK_VADDR + MEGA, arg0).map_err(|_| outcome::FAILED)?;
     Ok(())
@@ -305,7 +319,7 @@ fn ended(slots: &mut Slots, app: usize, failed: bool, hold: bool) {
         let _ = grant::unregister(REGISTER, app);
         let _ = sys::cnode::delete(SELF_CNODE, TCB + app);
         let _ = untyped::reset(SELF_CNODE, SLOT + app);
-        for channel in [KS_CHANNEL + app, ST_CHANNEL + app] {
+        for channel in [KS_CHANNEL + app, ST_CHANNEL + app, IN_CHANNEL + app, ID_CHANNEL + app] {
             clear(channel);
         }
         slots.slots[app] = Slot::Free;
