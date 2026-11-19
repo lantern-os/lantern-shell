@@ -1,0 +1,36 @@
+[package]
+name = "lantern-archiver"
+version = "0.0.0"
+edition = "2021"
+description = "RFC-0038's archiver: a confined riscv64 program that keeps audit history before the policy store retires it, sealed under its own keystore key, in the disk's archive partition, and reads it back for the shell. Holds no console, network or store capability."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_archiver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lantern-archiver"
+path = "src/main.rs"
+# Bare-metal riscv64 only: there is no `test` crate for this target.
+test = false
+
+[dependencies]
+# Local paths in this monorepo; rewrite to `git = "https://github.com/lantern-os/..."`
+# when pushing lantern-shell standalone.
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
+lantern-policy-store = { path = "../policy-store" }
+
+[features]
+# As `lantern-policy-store`'s: the console matrix's small audit sectors. Never in a real image.
+small-audit-sectors = ["lantern-policy-store/small-audit-sectors"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+# `lantern-boot` embeds this ELF in its own kernel image (`lantern-boot/linker.ld`).
+strip = true

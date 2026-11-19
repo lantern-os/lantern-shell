@@ -5,6 +5,11 @@
 **Roadmap:** Phase 3 closed and Phase 4 (hardware and assurance) opened, 2026-11-16, per [RFC-0036](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0036-phase-3-to-phase-4-transition.md)/[ADR-0041](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0041-phase-3-complete-phase-4-opened.md).
 
 ## Done
+- **Kept audit history (2026-11-19, [RFC-0038](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0038-signed-models-and-kept-audit-history.md)/[ADR-0043](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0043-signed-models-and-kept-audit-history.md)).** New confined program `archiver/` (lib, 6 host tests): exports each full audit
+  sector, sealed under its own keystore key, to the disk's archive partition, and reads it back. `policy-store` offers
+  sectors (`EXPORT_NEXT`/`EXPORT_READ`/`EXPORTED`, under `ARCHIVER_BADGE`), wakes the archiver without blocking, and
+  records what wasn't kept in `RETIRED` (47 tests); test feature `small-audit-sectors`. The shell's new `archive`
+  command lists and reads kept history; `audit` explains `RETIRED` and `EXPORTED`, and names a model's publisher.
 - **The launch binder v0 (2026-11-02), this repo's first code:** `launch-binder/`, per
   [RFC-0020](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0020-launch-binder.md)/[ADR-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0025-launch-binder.md).
   A confined program, and the only holder of authority to request grants from a service. It verifies

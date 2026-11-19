@@ -156,6 +156,9 @@ pub enum Command<'a> {
     Identities,
     Revoke(usize),
     Audit(usize),
+    /// [RFC-0038](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0038-signed-models-and-kept-audit-history.md): the archive's exports, or
+    /// with a number, its records from that sequence number on.
+    Archive(Option<usize>),
     Decisions,
     Forget(usize),
     Empty,
@@ -199,6 +202,8 @@ pub fn parse_command(line: &[u8]) -> Command<'_> {
         (b"decisions", None) => Command::Decisions,
         (b"audit", None) => Command::Audit(AUDIT_DEFAULT),
         (b"audit", Some(Some(n))) => Command::Audit(n),
+        (b"archive", None) => Command::Archive(None),
+        (b"archive", Some(Some(n))) => Command::Archive(Some(n)),
         (b"revoke", Some(Some(n))) => Command::Revoke(n),
         (b"forget", Some(Some(n))) => Command::Forget(n),
         _ => Command::Unknown,
@@ -287,6 +292,7 @@ pub fn event_name(event: u8) -> &'static str {
         QUOTA_REACHED => "QUOTA_REACHED",
         RETIRED => "RETIRED",
         CONSENTED => "CONSENTED",
+        EXPORTED => "EXPORTED",
         _ => "UNKNOWN",
     }
 }
@@ -330,6 +336,7 @@ pub const HELP: &str = "\
   write N TEXT replace file N with TEXT, as you\n\
   revoke N     end grant N now; it's asked again next time\n\
   audit [N]    the last N records of the audit log, verified first\n\
+  archive [N]  audit history kept after the log retired it; N: from record N\n\
   decisions    your remembered \"always\" and \"never\" answers\n\
   forget N     forget remembered answer N\n\
   help         this list\n";

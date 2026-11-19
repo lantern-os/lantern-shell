@@ -19,26 +19,9 @@ use lantern_filesystem::FileOps;
 use lantern_sdk::plan::ResourceRequest;
 use lantern_sdk::GrantPlan;
 
-/// An Ed25519 verifying key.
-pub type PublisherKey = [u8; 32];
-
-/// The verifying half of the **public** demo seed `lantern-sdk build --seed 4c4c…4c`. It
-/// proves the verification path, not anyone's identity.
-pub const DEMO_PUBLISHER: PublisherKey = [
-    0x92, 0x73, 0x08, 0xf5, 0x3d, 0x67, 0x65, 0x50, 0x3d, 0x2b, 0x64, 0xc1, 0x03, 0xab, 0x5a, 0xa4,
-    0x72, 0x06, 0xab, 0x39, 0x50, 0x2c, 0xfe, 0x8f, 0x98, 0x44, 0x2f, 0xdb, 0x54, 0x31, 0x00, 0xb7,
-];
-
-/// The same for seed `4d4d…4d`: trusted to publish, but with nothing approved in [`POLICY`].
-/// It exists so a test can show that claiming an approved app's name under another trusted
-/// publisher gets nothing.
-pub const OTHER_DEMO_PUBLISHER: PublisherKey = [
-    0x62, 0xa6, 0x11, 0xb4, 0x72, 0xd8, 0x9b, 0x0e, 0x5f, 0xc9, 0x3c, 0x06, 0x9b, 0x9f, 0x70, 0x0b,
-    0x4c, 0x55, 0x2d, 0x55, 0xbc, 0x0e, 0x87, 0xb5, 0x60, 0x08, 0xef, 0x17, 0xb6, 0xb2, 0xbe, 0xbe,
-];
-
-/// Whose packages this binder will read at all.
-pub const TRUSTED_PUBLISHERS: &[PublisherKey] = &[DEMO_PUBLISHER, OTHER_DEMO_PUBLISHER];
+// The trusted publishers live in `lantern_abi::publishers`, shared with the inference service, which trusts a model's
+// publisher exactly as this binder trusts an app's (RFC-0038).
+pub use lantern_abi::publishers::{PublisherKey, DEMO as DEMO_PUBLISHER, OTHER_DEMO as OTHER_DEMO_PUBLISHER, TRUSTED as TRUSTED_PUBLISHERS};
 
 /// [RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md): the principal a verified package's
 /// grants are made for, what the store records with every write they make. 48 bits of BLAKE3 over its publisher key and

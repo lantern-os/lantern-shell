@@ -45,6 +45,13 @@ const FLASH_VADDR: usize = 0x9400_0000;
 /// disk's policy partition instead of flash, which a machine booting through UEFI gives its firmware. The quota is
 /// `arg0`'s low 16 bits.
 const ON_DISK: usize = 1 << 20;
+/// [RFC-0038](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0038-signed-models-and-kept-audit-history.md): `arg0`'s flag for an archiver.
+/// It has the page at [`ARCHIVER_PAGE_VADDR`] mapped too, which `EXPORT_READ` copies a sector's words into, and the
+/// archiver's endpoint at [`ARCHIVER_WAKE_CPTR`], under `ARCHIVER_WAKE_BADGE`, to wake it without blocking.
+const WITH_ARCHIVER: usize = 1 << 21;
+const ARCHIVER_PAGE_VADDR: usize = 0x9002_0000;
+const ARCHIVER_WAKE_CPTR: usize = 6;
+
 /// The volume, under its `POLICY` badge, and its channel.
 const VOLUME_CPTR: usize = 5;
 const VOLUME_VADDR: usize = 0x9001_0000;
@@ -245,10 +252,19 @@ fn run(arg0: usize) -> ! {
     let mut decisions = Decisions::open(AnyFlash);
     let limit = if quota == 0 { policy::USE_QUOTA } else { (quota as u32).min(policy::USE_QUOTA) };
     let mut quota = Quota::<QUOTA_GRANTS>::new(limit);
+    let archiver = arg0 & WITH_ARCHIVER != 0;
     loop {
+        // While a full sector waits to be kept, every request wakes the archiver: without blocking, so it's dropped if
+        // the archiver is busy, and the archiver looks for work again after everything it does. No wake-up is lost.
+        if archiver && audit.exportable().ok().flatten().is_some() {
+            let _ = sys::nb_send(ARCHIVER_WAKE_CPTR, [0, 0, 0]);
+        }
         let Ok(received) = sys::recv(ENDPOINT_CPTR) else { continue };
         let request = policy::request(&received);
         let _ = match request.source {
+            Source::Archiver if archiver => {
+                serve_archiver(&mut audit, request.op, request.word, request.index as usize, received.msg[1] as u64)
+            }
             Source::Reader => serve_reader(&audit, request.op, request.index),
             Source::Binder => match request.op {
                 policy::OP_APPEND => policy::reply_append(append(&mut audit, Source::Binder, request.entry)),
@@ -298,7 +314,7 @@ fn run(arg0: usize) -> ! {
                 };
                 policy::reply_append(answer)
             }
-            Source::Service(_) | Source::Unknown => policy::reply_refused(),
+            Source::Service(_) | Source::Archiver | Source::Unknown => policy::reply_refused(),
         };
     }
 }
@@ -312,6 +328,38 @@ fn append(audit: &mut AuditLog<AnyFlash>, source: Source, entry: AuditEntry) -> 
         status::OK
     } else {
         status::FAILED
+    }
+}
+
+/// RFC-0038's export operations, for the archiver's badge: which full sector is waiting, its words a page at a time,
+/// and that it's kept. It can't read the sector being written, or report anything but the end it was given.
+fn serve_archiver(
+    audit: &mut AuditLog<AnyFlash>,
+    op: u32,
+    word: usize,
+    index: usize,
+    dropped: u64,
+) -> Result<(), lantern_abi::wire::SyscallError> {
+    match op {
+        policy::OP_EXPORT_NEXT => match audit.exportable() {
+            Ok(Some(e)) => sys::reply_with_label(status::OK as u32, [e.first as usize, e.end as usize, e.sector]),
+            Ok(None) => sys::reply_with_label(status::INVALID as u32, [0, 0, 0]),
+            Err(_) => sys::reply_with_label(status::FAILED as u32, [0, 0, 0]),
+        },
+        policy::OP_EXPORT_READ => {
+            // SAFETY: with `WITH_ARCHIVER`, the loader mapped one page read/write at ARCHIVER_PAGE_VADDR, shared with the
+            // archiver alone, which reads it only after this reply.
+            let page = unsafe { core::slice::from_raw_parts_mut(ARCHIVER_PAGE_VADDR as *mut u32, policy::EXPORT_WORDS) };
+            match audit.export_read(word, index, page) {
+                Ok(n) => sys::reply_with_label(status::OK as u32, [n, 0, 0]),
+                Err(_) => sys::reply_with_label(status::INVALID as u32, [0, 0, 0]),
+            }
+        }
+        policy::OP_EXPORTED => {
+            let answer = if audit.mark_exported(word as u64, dropped).is_ok() { status::OK } else { status::INVALID };
+            sys::reply_with_label(answer as u32, [0, 0, 0])
+        }
+        _ => policy::reply_refused(),
     }
 }
 

@@ -10,8 +10,11 @@ agents, and where the [AI](https://github.com/lantern-os/lantern-docs/blob/main/
   Personal Agent surface described in [wiki/Intent-Model](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Intent-Model.md).
   Current scope stays limited to the consent-broker role below; see [`STATUS.md`](./STATUS.md).
 
-> **Phase 4** ([RFC-0036](../lantern-rfcs/rfcs/0036-phase-3-to-phase-4-transition.md)): hardware and assurance. The launch binder, the launcher, the shell (the trusted path, where a person decides every grant)
-> and `policy-store` (remembered decisions and the audit log) run confined in the system image. See [`STATUS.md`](./STATUS.md).
+> **Phase 4** ([RFC-0036](../lantern-rfcs/rfcs/0036-phase-3-to-phase-4-transition.md)): hardware and assurance. The launch
+> binder, the launcher, the shell (the trusted path, where a person decides every grant),
+> `policy-store` (remembered decisions and the audit log) and the `archiver`, which keeps audit history sealed before the
+> log retires it ([RFC-0038](../lantern-rfcs/rfcs/0038-signed-models-and-kept-audit-history.md)), run confined in the
+> system image. See [`STATUS.md`](./STATUS.md).
 
 ## In this repo
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`THREAT_MODEL.md`](./THREAT_MODEL.md), [`STATUS.md`](./STATUS.md).
