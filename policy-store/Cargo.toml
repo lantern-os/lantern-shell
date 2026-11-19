@@ -21,6 +21,11 @@ test = false
 lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main", features = ["rt"] }
 lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }
 
+[features]
+# RFC-0038's console matrix only: 63 audit records a sector instead of 4,095, so the ring fills and the archiver exports
+# within a test's time. Never in a real image.
+small-audit-sectors = []
+
 [profile.dev]
 panic = "abort"
 

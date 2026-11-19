@@ -31,7 +31,7 @@ use lantern_abi::consent::{self, bit, Answer};
 use lantern_abi::frame::status;
 use lantern_abi::grant::{self, APP_SLOTS};
 use lantern_abi::launcher::{self, outcome, shell_bit, OP_LIST, OP_RUN};
-use lantern_abi::policy::{self, decision};
+use lantern_abi::policy::{self, decision, AuditEntry};
 use lantern_abi::provenance;
 use lantern_abi::sys::{self, irq};
 use lantern_policy_store::audit::chain;
@@ -60,6 +60,8 @@ const STORE_CONSOLE_CPTR: usize = 12;
 const STORE_CONSOLE_VADDR: usize = 0x9002_0000;
 /// RFC-0035: the wallet's endpoint under `identity::READER_BADGE`: what it presented, never a key.
 const WALLET_READER_CPTR: usize = 13;
+/// The archiver, under its reader badge ([RFC-0038](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0038-signed-models-and-kept-audit-history.md)).
+const ARCHIVE_CPTR: usize = 14;
 
 /// Must equal the system loader's: the UART's page, and the consent `Frame` shared with the binder.
 const UART_VADDR: usize = 0x9500_0000;
@@ -361,6 +363,7 @@ fn handle_line(out: &mut Console, line: &[u8], state: Prompt, launching: &mut Op
         Command::Grants => grants(out),
         Command::Files => files(out),
         Command::Identities => identities(out),
+        Command::Archive(from) => archive(out, from),
         Command::Read(file) => {
             let mut content = [0u8; 256];
             match console_read(file, &mut content) {
@@ -586,6 +589,71 @@ fn decisions(out: &mut Console) {
 
 /// Verifies the whole chain from the oldest surviving record, then shows the last `count`. The log is shown only if it
 /// verifies.
+/// RFC-0038: what a `RETIRED` or `EXPORTED` record says about history: kept in the archive, dropped from it, or lost.
+fn history_detail(out: &mut Console, e: &AuditEntry) {
+    let [a, b] = e.subject;
+    if e.event == policy::event::RETIRED {
+        let _ = match b {
+            policy::KEPT_UNKNOWN => write!(out, " (#{a} and before retired; whether they were kept is unknown)"),
+            b if b > a => write!(out, " (#{a} and before retired, all kept in the archive)"),
+            b => write!(out, " (#{a} and before retired; #{b} to #{a} were never kept: lost)"),
+        };
+    } else if e.event == policy::event::EXPORTED {
+        let _ = write!(out, " (kept in the archive up to #{})", a.saturating_sub(1));
+        if b > 0 {
+            let _ = write!(out, " (the archive dropped #{} and before to make room)", b - 1);
+        }
+    }
+}
+
+/// `archive`: each export the archiver holds, oldest first. `archive N`: its records from sequence number `N`, each
+/// export checked whole by the archiver before any record of it is shown.
+fn archive(out: &mut Console, from: Option<usize>) {
+    let Some(from) = from else {
+        let mut any = false;
+        for i in 0.. {
+            match sys::call_with_label(ARCHIVE_CPTR, lantern_abi::archive::OP_LIST, [0, i, 0]) {
+                Ok(([first, end, dropped], tag)) if tag.label == status::OK as u32 => {
+                    any = true;
+                    let _ = write!(out, "  #{first} to #{}", end.saturating_sub(1));
+                    if dropped > 0 && i == 0 {
+                        let _ = write!(out, "  (#{} and before dropped to make room)", dropped - 1);
+                    }
+                    let _ = out.write_str("\n");
+                }
+                Ok(_) => break,
+                Err(_) => {
+                    let _ = out.write_str("lantern: the archive can't be reached.\n");
+                    return;
+                }
+            }
+        }
+        if !any {
+            let _ = out.write_str("  the archive holds nothing\n");
+        }
+        return;
+    };
+    for sequence in from as u64..from as u64 + lantern_shell::AUDIT_DEFAULT as u64 {
+        let Ok((answer, e)) = policy::read(ARCHIVE_CPTR, sequence) else {
+            let _ = out.write_str("lantern: the archive can't be reached.\n");
+            return;
+        };
+        match answer {
+            status::OK => record_line(out, sequence, &e),
+            status::FAILED => {
+                let _ = writeln!(out, "lantern: the archive's copy of record #{sequence} does NOT verify. It isn't shown.");
+                return;
+            }
+            _ => {
+                if sequence == from as u64 {
+                    let _ = writeln!(out, "lantern: the archive doesn't hold record #{sequence}.");
+                }
+                return;
+            }
+        }
+    }
+}
+
 fn audit(out: &mut Console, count: usize) {
     let (Ok((status::OK, total, head)), Ok((status::OK, oldest, previous))) =
         (policy::head(READER_CPTR), policy::oldest(READER_CPTR))
@@ -610,23 +678,30 @@ fn audit(out: &mut Console, count: usize) {
     let _ = writeln!(out, "  {} records, verified{}", total - oldest, if oldest > 0 { "; older ones retired" } else { "" });
     for index in total.saturating_sub(count as u64).max(oldest)..total {
         if let Ok((status::OK, e)) = policy::read(READER_CPTR, index) {
-            let reason = reason_name(e.event, e.reason);
-            let _ = write!(out, "  #{index:<6} {:<16}", event_name(e.event));
-            if e.interface != 0 {
-                let _ = write!(out, " {} {}", interface_name(e.interface), Ops { interface: e.interface, bits: e.ops });
-            }
-            // RFC-0034: which model ran, on how much, for how long; and what the person wrote themselves.
-            if e.event == policy::event::USING && e.interface as usize == grant::INTERFACE_INFERENCE {
-                let (model, tokens, prompt) = lantern_abi::inference::split_audit_subject(e.subject[1]);
-                let _ = write!(out, " (model {model:08x}, up to {tokens} tokens, {prompt}-byte prompt)");
-            } else if e.event == policy::event::USING && e.interface as usize == grant::INTERFACE_IDENTITY {
-                let (key, len) = lantern_abi::identity::split_audit_subject(e.subject[1]);
-                let peer = lantern_abi::identity::context(e.object).map_or("an unknown peer", |c| c.peer);
-                let _ = write!(out, " to {peer} as {key:08x}.. ({len} bytes)");
-            } else if e.event == policy::event::USING && e.subject[0] == provenance::STORE_CONSOLE_BADGE {
-                let _ = write!(out, " file {} (you, at the console)", e.object);
-            }
-            let _ = writeln!(out, "{}{}", if reason.is_empty() { "" } else { "  " }, reason);
+            record_line(out, index, &e);
         }
     }
+}
+
+/// One audit record, as `audit` and `archive` show it.
+fn record_line(out: &mut Console, index: u64, e: &AuditEntry) {
+    let reason = reason_name(e.event, e.reason);
+    let _ = write!(out, "  #{index:<6} {:<16}", event_name(e.event));
+    if e.interface != 0 {
+        let _ = write!(out, " {} {}", interface_name(e.interface), Ops { interface: e.interface, bits: e.ops });
+    }
+    // RFC-0034: which model ran, on how much, for how long; RFC-0038: whose model it was. And what the person wrote
+    // themselves.
+    if e.event == policy::event::USING && e.interface as usize == grant::INTERFACE_INFERENCE {
+        let (model, tokens, prompt) = lantern_abi::inference::split_audit_subject(e.subject[1]);
+        let _ = write!(out, " (model {model:08x} by publisher {:04x}, up to {tokens} tokens, {prompt}-byte prompt)", e.object);
+    } else if e.event == policy::event::USING && e.interface as usize == grant::INTERFACE_IDENTITY {
+        let (key, len) = lantern_abi::identity::split_audit_subject(e.subject[1]);
+        let peer = lantern_abi::identity::context(e.object).map_or("an unknown peer", |c| c.peer);
+        let _ = write!(out, " to {peer} as {key:08x}.. ({len} bytes)");
+    } else if e.event == policy::event::USING && e.subject[0] == provenance::STORE_CONSOLE_BADGE {
+        let _ = write!(out, " file {} (you, at the console)", e.object);
+    }
+    history_detail(out, e);
+    let _ = writeln!(out, "{}{}", if reason.is_empty() { "" } else { "  " }, reason);
 }

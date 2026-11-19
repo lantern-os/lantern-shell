@@ -20,14 +20,21 @@
 //! only while that head's history hasn't been retired. Resisting it needs a key held in hardware and a
 //! monotonic counter: Phase 4, on RFC-0023's checklist.
 
-use lantern_abi::policy::{event, AuditEntry};
+use lantern_abi::policy::{event, AuditEntry, KEPT_UNKNOWN};
 use lantern_crypto::hash;
 
 use crate::Flash;
 
 const ERASED: u32 = u32::MAX;
 const SLOT_WORDS: usize = 16;
-const SECTOR_WORDS: usize = 0x4_0000 / 4;
+/// Where each sector starts: every 256 KiB, as on flash.
+const SECTOR_STRIDE: usize = 0x4_0000 / 4;
+/// The words of each sector the log uses. All of it, except with the test-only feature `small-audit-sectors`
+/// (RFC-0038's console matrix), which uses 63 records a sector, so the ring fills, wraps and exports in seconds.
+#[cfg(not(feature = "small-audit-sectors"))]
+const SECTOR_WORDS: usize = SECTOR_STRIDE;
+#[cfg(feature = "small-audit-sectors")]
+const SECTOR_WORDS: usize = 1024;
 /// Sectors 2 to 7 of the mapped megapage. Sector 0 is the revocation log's and sector 1 the remembered decisions'
 /// ([RFC-0026](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0026-trusted-path-and-consent.md)), and retention never touches either.
 pub const FIRST_SECTOR: usize = 2;
@@ -130,7 +137,21 @@ pub struct Head {
     pub oldest: u64,
     pub oldest_previous: [u8; 16],
     pub oldest_sector: usize,
+    /// RFC-0038: the first record not yet kept in the archive. Retiring history before it loses nothing.
+    pub exported: u64,
 }
+
+/// A full sector ready to be kept in the archive (RFC-0038): which one, and the sequence numbers it holds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Exportable {
+    pub sector: usize,
+    pub first: u64,
+    /// The first sequence number after it: what the archiver reports, once it's kept.
+    pub end: u64,
+}
+
+/// Words in one sector, header included: what an exported sector holds.
+pub const EXPORT_SECTOR_WORDS: usize = SECTOR_WORDS;
 
 /// Why the log can't be read or written. The binder declines every grant on it, and a service every operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -153,6 +174,9 @@ pub enum Pending {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Scanned {
     pub head: Head,
+    /// How far the surviving `EXPORTED` and `RETIRED` records say history was kept, if any survive. `head.exported` is
+    /// this, or the oldest record if it's earlier or unknown.
+    pub kept_mark: Option<u64>,
     /// A torn last record, by sector and slot, for [`AuditLog::open`] to tombstone.
     pub torn: Option<(usize, usize)>,
     pub pending: Pending,
@@ -213,8 +237,9 @@ pub fn scan<F: Flash>(flash: &F, mut on_record: impl FnMut(u64, &AuditEntry)) ->
                 oldest: 0,
                 oldest_previous: GENESIS,
                 oldest_sector: FIRST_SECTOR,
+                exported: 0,
             };
-            Ok(Scanned { head, torn: None, pending: Pending::Start })
+            Ok(Scanned { head, kept_mark: None, torn: None, pending: Pending::Start })
         } else {
             Err(Corrupt)
         };
@@ -232,6 +257,7 @@ pub fn scan<F: Flash>(flash: &F, mut on_record: impl FnMut(u64, &AuditEntry)) ->
     let mut torn = None;
     let mut next_slot = 0;
     let mut newest_records = 0;
+    let mut kept_mark: Option<u64> = None;
     for run in 0..valid {
         let Kind::Header { first, previous } = kinds[sector] else { return Err(Corrupt) };
         if (first, previous) != (count, head) {
@@ -253,6 +279,7 @@ pub fn scan<F: Flash>(flash: &F, mut on_record: impl FnMut(u64, &AuditEntry)) ->
                 continue;
             }
             if let Some((entry, chained)) = follows(&words, count, head) {
+                kept_mark = kept_mark.max(kept_by(&entry));
                 on_record(count, &entry);
                 (count, head) = (count + 1, chained);
                 newest_records += 1;
@@ -287,8 +314,56 @@ pub fn scan<F: Flash>(flash: &F, mut on_record: impl FnMut(u64, &AuditEntry)) ->
     if valid > 1 && retires(&kinds, sector) && newest_records == 0 && pending == Pending::Nothing {
         pending = Pending::RecordRetired;
     }
-    let head = Head { sector, next_slot, count, head, oldest, oldest_previous, oldest_sector };
-    Ok(Scanned { head, torn, pending })
+    let exported = kept_mark.unwrap_or(oldest).max(oldest);
+    let head = Head { sector, next_slot, count, head, oldest, oldest_previous, oldest_sector, exported };
+    Ok(Scanned { head, kept_mark, torn, pending })
+}
+
+/// How far a record says history was kept: an `EXPORTED`'s `kept through`, or a `RETIRED`'s last retired record and
+/// everything before it, which is either kept or recorded as lost.
+fn kept_by(entry: &AuditEntry) -> Option<u64> {
+    match entry.event {
+        event::EXPORTED => Some(entry.subject[0]),
+        event::RETIRED => entry.subject[0].checked_add(1),
+        _ => None,
+    }
+}
+
+/// Checks one exported sector on its own (RFC-0038): its header, then records that each follow from the one before,
+/// or tombstones. Gives the first sequence number, the chain head before it, how many records it holds, and the chain
+/// head after them, so a reader can join exported sectors to each other and to the live log.
+pub fn verify_sector(words: &[u32]) -> Result<(u64, [u8; 16], u64, [u8; 16]), Corrupt> {
+    if words.len() != SECTOR_WORDS {
+        return Err(Corrupt);
+    }
+    let slot = |i: usize| -> Slot { words[i * SLOT_WORDS..(i + 1) * SLOT_WORDS].try_into().unwrap() };
+    let header = slot(0);
+    if header[..3] != MAGIC || header[9..] != [0; 7] {
+        return Err(Corrupt);
+    }
+    let (first, previous) = (header[3] as u64 | (header[4] as u64) << 32, words_hash(&header[5..9]));
+    let (mut count, mut head) = (first, previous);
+    for i in 1..=SECTOR_SLOTS {
+        let words = slot(i);
+        if words == [0; SLOT_WORDS] {
+            continue;
+        }
+        let (_, chained) = follows(&words, count, head).ok_or(Corrupt)?;
+        (count, head) = (count + 1, chained);
+    }
+    Ok((first, previous, count - first, head))
+}
+
+/// The records an exported sector holds, in order, with their sequence numbers. Only for a sector [`verify_sector`]
+/// accepted.
+pub fn sector_records(words: &[u32]) -> impl Iterator<Item = (u64, AuditEntry)> + '_ {
+    (1..=SECTOR_SLOTS).filter_map(move |i| {
+        let words: Slot = words[i * SLOT_WORDS..(i + 1) * SLOT_WORDS].try_into().ok()?;
+        (words != [0; SLOT_WORDS]).then(|| {
+            let (entry, sequence) = entry_of(&words);
+            (sequence, entry)
+        })
+    })
 }
 
 /// Whether a head kept from earlier still matches, now that some history may be retired.
@@ -332,11 +407,14 @@ impl<F: Flash> AuditLog<F> {
             let torn_ok = scanned.torn.is_none_or(|(sector, slot)| log.write(slot_word(sector, slot), &[0; SLOT_WORDS]));
             if torn_ok {
                 log.state = Some(scanned.head);
+                // A `RETIRED` interrupted by a power cut: the records saying how far history was kept may have been in the
+                // sector just erased. Only a surviving mark is trusted; otherwise it's recorded as unknown.
+                let kept = scanned.kept_mark.unwrap_or(KEPT_UNKNOWN);
                 let finished = match scanned.pending {
                     Pending::Nothing => Ok(()),
                     Pending::Start => log.open_sector(FIRST_SECTOR),
-                    Pending::Reopen(sector) => log.reopen(sector),
-                    Pending::RecordRetired => log.append_retired(),
+                    Pending::Reopen(sector) => log.reopen_with(sector, Some(kept)),
+                    Pending::RecordRetired => log.append_retired(kept),
                 };
                 if finished.is_err() {
                     log.state = None;
@@ -399,6 +477,49 @@ impl<F: Flash> AuditLog<F> {
         Err(Corrupt)
     }
 
+    /// RFC-0038: the oldest full sector holding history not yet kept, if any. The sector being written isn't full,
+    /// and is never offered.
+    pub fn exportable(&self) -> Result<Option<Exportable>, Corrupt> {
+        let state = self.state.ok_or(Corrupt)?;
+        let mut sector = state.oldest_sector;
+        let mut first = state.oldest;
+        while sector != state.sector {
+            let next = ring_next(sector);
+            let end = classify_header(&self.flash, next).ok_or(Corrupt)?;
+            if end > state.exported {
+                return Ok(Some(Exportable { sector, first, end }));
+            }
+            (sector, first) = (next, end);
+        }
+        Ok(None)
+    }
+
+    /// RFC-0038: copies `sector`'s raw words from `offset` into `out`, header included, and says how many. Only the
+    /// sector [`Self::exportable`] offers is readable.
+    pub fn export_read(&self, sector: usize, offset: usize, out: &mut [u32]) -> Result<usize, Corrupt> {
+        if self.exportable()?.map(|e| e.sector) != Some(sector) || offset > SECTOR_WORDS {
+            return Err(Corrupt);
+        }
+        let n = out.len().min(SECTOR_WORDS - offset);
+        for (i, word) in out[..n].iter_mut().enumerate() {
+            *word = self.flash.read(sector_word(sector) + offset + i);
+        }
+        Ok(n)
+    }
+
+    /// RFC-0038: the archiver has kept history up to `end`, which must be the end [`Self::exportable`] gave. Records
+    /// `EXPORTED`; history before `end` may now be retired without loss.
+    pub fn mark_exported(&mut self, end: u64, dropped: u64) -> Result<(), Corrupt> {
+        if self.exportable()?.map(|e| e.end) != Some(end) {
+            return Err(Corrupt);
+        }
+        // The mark moves first: the archiver's report is what makes the sector kept. With the ring full, appending
+        // `EXPORTED` retires the oldest sector, and its `RETIRED` must already count this one as kept.
+        let state = self.state.ok_or(Corrupt)?;
+        self.state = Some(Head { exported: state.exported.max(end), ..state });
+        self.append(&AuditEntry { event: event::EXPORTED, subject: [end, dropped], ..AuditEntry::default() })
+    }
+
     fn write_record(&mut self, entry: &AuditEntry) -> Result<(), Corrupt> {
         let state = self.state.ok_or(Corrupt)?;
         let chained = chain(state.head, entry, state.count);
@@ -424,8 +545,15 @@ impl<F: Flash> AuditLog<F> {
     }
 
     /// Erases `sector` and continues the chain in it. If that retires history, which it does whenever `sector`
-    /// was the oldest, the oldest becomes the sector after it, and the first record is `RETIRED`.
+    /// was the oldest, the oldest becomes the sector after it, and the first record is `RETIRED`, saying how far the
+    /// retired history had been kept.
     fn reopen(&mut self, sector: usize) -> Result<(), Corrupt> {
+        self.reopen_with(sector, None)
+    }
+
+    /// [`Self::reopen`], with `kept` overriding how far history was kept: on recovery, from the records that survive.
+    fn reopen_with(&mut self, sector: usize, kept: Option<u64>) -> Result<(), Corrupt> {
+        let kept = kept.unwrap_or(self.state.ok_or(Corrupt)?.exported);
         let mut kinds = [Kind::Erased; LAST_SECTOR + 1];
         kinds[ring_next(sector)] = classify(&self.flash, ring_next(sector));
         self.flash.erase_sector(sector_word(sector), SECTOR_WORDS);
@@ -439,13 +567,20 @@ impl<F: Flash> AuditLog<F> {
         let state = self.state.ok_or(Corrupt)?;
         let Kind::Header { first, previous } = kinds[ring_next(sector)] else { return Err(Corrupt) };
         self.state = Some(Head { oldest: first, oldest_previous: previous, oldest_sector: ring_next(sector), ..state });
-        self.append_retired()
+        self.append_retired(kept)
     }
 
-    fn append_retired(&mut self) -> Result<(), Corrupt> {
+    /// `RETIRED`: the last retired record, and `kept`, how far history before it had been exported. Everything retired
+    /// is then either kept or recorded as lost, so `exported` moves past it.
+    fn append_retired(&mut self, kept: u64) -> Result<(), Corrupt> {
         let state = self.state.ok_or(Corrupt)?;
-        let retired =
-            AuditEntry { event: event::RETIRED, slot: state.sector as u8, subject: [state.oldest - 1, 0], ..AuditEntry::default() };
+        let retired = AuditEntry {
+            event: event::RETIRED,
+            slot: state.sector as u8,
+            subject: [state.oldest - 1, kept],
+            ..AuditEntry::default()
+        };
+        self.state = Some(Head { exported: state.exported.max(state.oldest), ..state });
         // A failure here leaves the newest sector without `RETIRED`. Failing closed means the next open, which
         // sees that, writes it.
         self.write_record(&retired).inspect_err(|_| self.state = None)
@@ -465,7 +600,7 @@ fn classify_header<F: Flash>(flash: &F, sector: usize) -> Option<u64> {
 }
 
 fn sector_word(sector: usize) -> usize {
-    sector * SECTOR_WORDS
+    sector * SECTOR_STRIDE
 }
 
 fn slot_word(sector: usize, slot: usize) -> usize {
@@ -738,6 +873,128 @@ mod tests {
             assert_eq!(seen.last(), Some(&event::BOOT), "cut at {cut}: {seen:?}");
             assert_eq!(seen.iter().filter(|&&e| e == event::RETIRED).count(), 1, "cut at {cut}");
             assert_eq!(after.count, head.count, "cut at {cut}");
+        }
+    }
+
+    /// RFC-0038: exports the offered sector, checks it on its own, and reports it kept.
+    fn export(log: &mut AuditLog<FakeFlash>) -> Option<Exportable> {
+        let offered = log.exportable().unwrap()?;
+        let mut words = vec![0u32; EXPORT_SECTOR_WORDS];
+        let mut at = 0;
+        while at < words.len() {
+            at += log.export_read(offered.sector, at, &mut words[at..(at + 1024).min(EXPORT_SECTOR_WORDS)]).unwrap();
+        }
+        let (first, _, records, _) = verify_sector(&words).unwrap();
+        assert_eq!((first, first + records), (offered.first, offered.end));
+        log.mark_exported(offered.end, 0).unwrap();
+        Some(offered)
+    }
+
+    fn retirements<F: Flash>(flash: &F) -> Vec<[u64; 2]> {
+        let mut out = Vec::new();
+        scan(flash, |_, entry| {
+            if entry.event == event::RETIRED {
+                out.push(entry.subject)
+            }
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn history_exported_as_each_sector_fills_is_retired_without_loss() {
+        let flash = flash();
+        let mut log = AuditLog::open(flash.clone());
+        assert_eq!(log.exportable(), Ok(None), "only the sector being written: nothing to export");
+        // Twice round the ring, exporting every full sector as soon as it's offered.
+        for _ in 0..2 * CAPACITY {
+            log.append(&granting(0)).unwrap();
+            while export(&mut log).is_some() {}
+        }
+        let retired = retirements(&flash);
+        assert!(retired.len() >= 6, "{retired:?}");
+        for [last, kept] in &retired {
+            assert!(kept > last, "kept through {kept}, past the last retired {last}: nothing lost");
+        }
+        // Every full sector is kept: what's left unexported is the sector being written.
+        let head = verify_all(&flash);
+        assert_eq!(log.exportable(), Ok(None));
+        assert!(head.exported <= head.count && head.count - head.exported <= SECTOR_SLOTS as u64, "{head:?}");
+        assert_eq!(AuditLog::open(flash.clone()).head().unwrap().exported, log.head().unwrap().exported, "kept across a restart");
+    }
+
+    #[test]
+    fn history_never_exported_is_retired_and_recorded_lost() {
+        let flash = flash();
+        let mut log = AuditLog::open(flash.clone());
+        fill_to(&mut log, LAST_SECTOR, 0);
+        // Only the first sector is kept; then the ring wraps twice.
+        let first = export(&mut log).unwrap();
+        for _ in 0..2 * SECTOR_SLOTS {
+            log.append(&granting(0)).unwrap();
+        }
+        let retired = retirements(&flash);
+        // The first retirement loses nothing; the second loses the whole of the second sector, exactly.
+        assert_eq!(retired[0][1], first.end, "{retired:?}");
+        assert!(retired[0][1] > retired[0][0]);
+        let [last, kept] = retired[1];
+        assert_eq!(kept, first.end, "kept only through the first sector");
+        assert!(last >= kept, "so {kept}..={last} are lost");
+    }
+
+    #[test]
+    fn the_archiver_reads_and_reports_only_the_sector_offered() {
+        let flash = flash();
+        let mut log = AuditLog::open(flash.clone());
+        fill_to(&mut log, FIRST_SECTOR + 2, 1);
+        let offered = log.exportable().unwrap().unwrap();
+        assert_eq!(offered.sector, FIRST_SECTOR);
+        let mut out = [0u32; 16];
+        assert_eq!(log.export_read(FIRST_SECTOR + 1, 0, &mut out), Err(Corrupt), "not offered yet");
+        assert_eq!(log.export_read(FIRST_SECTOR + 2, 0, &mut out), Err(Corrupt), "the sector being written");
+        assert_eq!(log.export_read(FIRST_SECTOR, SECTOR_WORDS - 4, &mut out), Ok(4), "the end of the sector");
+        assert_eq!(log.mark_exported(offered.end + 1, 0), Err(Corrupt), "not the end it was given");
+        assert_eq!(log.mark_exported(offered.first, 0), Err(Corrupt));
+        log.mark_exported(offered.end, 0).unwrap();
+        assert_eq!(log.exportable().unwrap().unwrap().sector, FIRST_SECTOR + 1, "the next one");
+        assert_eq!(log.mark_exported(offered.end, 0), Err(Corrupt), "already kept");
+    }
+
+    #[test]
+    fn a_changed_bit_in_an_exported_sector_is_caught() {
+        let flash = flash();
+        let mut log = AuditLog::open(flash.clone());
+        // One record into the second sector: the first is full, and offered.
+        fill_to(&mut log, FIRST_SECTOR + 1, SECTOR_SLOTS - 1);
+        let mut words = vec![0u32; EXPORT_SECTOR_WORDS];
+        let n = log.export_read(FIRST_SECTOR, 0, &mut words).unwrap();
+        assert_eq!(n, EXPORT_SECTOR_WORDS);
+        assert!(verify_sector(&words).is_ok());
+        for word in [0, 3, 5, SLOT_WORDS, SLOT_WORDS + 9, SECTOR_WORDS / 2, SECTOR_WORDS - SLOT_WORDS + 1] {
+            let mut bad = words.clone();
+            bad[word] ^= 1;
+            assert_eq!(verify_sector(&bad), Err(Corrupt), "word {word}");
+        }
+        assert_eq!(verify_sector(&words[1..]), Err(Corrupt), "too short");
+    }
+
+    #[test]
+    fn a_power_cut_mid_retirement_never_claims_more_was_kept() {
+        let template = flash();
+        let mut log = AuditLog::open(template.clone());
+        fill_to(&mut log, LAST_SECTOR, 0);
+        let before = log.head().unwrap();
+        for cut in [0, 5, SLOT_WORDS, SLOT_WORDS + 3, SLOT_WORDS * 2, SLOT_WORDS * 2 + 7] {
+            let flash = template.deep_copy();
+            let mut log = AuditLog { flash: flash.clone(), state: Some(before) };
+            flash.lose_power_after(cut);
+            let _ = log.append(&granting(1));
+            flash.power_back();
+            AuditLog::open(flash.clone()).head().unwrap();
+            let [last, kept] = retirements(&flash)[0];
+            // Nothing was exported: it's recorded as lost from 0, or unknown, never as kept.
+            assert!(kept == 0 || kept == KEPT_UNKNOWN, "cut at {cut}: kept {kept}");
+            assert_eq!(last, SECTOR_SLOTS as u64 - 1, "cut at {cut}");
         }
     }
 
