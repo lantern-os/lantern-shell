@@ -5,6 +5,8 @@
 **Roadmap:** Phase 3 closed and Phase 4 (hardware and assurance) opened, 2026-11-16, per [RFC-0036](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0036-phase-3-to-phase-4-transition.md)/[ADR-0041](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0041-phase-3-complete-phase-4-opened.md).
 
 ## Done
+- **The shell drives the console at boot's layout (2026-11-23, [RFC-0039](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0039-bring-up-on-the-k3-pico-itx.md)):** register spacing and width from `arg0`, and an
+  XScale-style UART's unit-enable and receive time-out bits kept set, as the K3's needs.
 - **Kept audit history (2026-11-19, [RFC-0038](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0038-signed-models-and-kept-audit-history.md)/[ADR-0043](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0043-signed-models-and-kept-audit-history.md)).** New confined program `archiver/` (lib, 6 host tests): exports each full audit
   sector, sealed under its own keystore key, to the disk's archive partition, and reads it back. `policy-store` offers
   sectors (`EXPORT_NEXT`/`EXPORT_READ`/`EXPORTED`, under `ARCHIVER_BADGE`), wakes the archiver without blocking, and

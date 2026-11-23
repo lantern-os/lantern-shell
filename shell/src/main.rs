@@ -28,6 +28,7 @@
 use core::fmt::Write;
 
 use lantern_abi::consent::{self, bit, Answer};
+use lantern_abi::console::UartLayout;
 use lantern_abi::frame::status;
 use lantern_abi::grant::{self, APP_SLOTS};
 use lantern_abi::launcher::{self, outcome, shell_bit, OP_LIST, OP_RUN};
@@ -78,20 +79,49 @@ const RBR_THR: usize = 0;
 const IER: usize = 1;
 const LSR: usize = 5;
 const IER_RX_AVAILABLE: u8 = 1 << 0;
+/// An XScale-style UART's receive time-out interrupt and unit enable (`lantern_abi::console`): the K3's.
+const IER_XSCALE_RX_TIMEOUT: u8 = 1 << 4;
+const IER_XSCALE_UNIT_ENABLE: u8 = 1 << 6;
 const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_THR_EMPTY: u8 = 1 << 5;
 
 lantern_abi::entry!(run);
 
+/// The UART's register layout, from boot (`lantern_abi::console`). Set once, first thing in `run`.
+static LAYOUT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn layout() -> UartLayout {
+    UartLayout::decode(LAYOUT.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+fn uart_register(offset: usize) -> usize {
+    let layout = layout();
+    UART_VADDR + layout.offset as usize + (offset << layout.reg_shift)
+}
+
 fn uart_read(offset: usize) -> u8 {
+    let at = uart_register(offset);
     // SAFETY: the loader mapped the UART's 4 KiB page read/write at UART_VADDR for this program's whole life, and no other
-    // program maps it. These are its byte registers.
-    unsafe { core::ptr::read_volatile((UART_VADDR + offset) as *const u8) }
+    // program maps it. The layout boot gave keeps every register inside that page.
+    unsafe {
+        if layout().wide {
+            core::ptr::read_volatile(at as *const u32) as u8
+        } else {
+            core::ptr::read_volatile(at as *const u8)
+        }
+    }
 }
 
 fn uart_write(offset: usize, value: u8) {
+    let at = uart_register(offset);
     // SAFETY: as `uart_read`.
-    unsafe { core::ptr::write_volatile((UART_VADDR + offset) as *mut u8, value) }
+    unsafe {
+        if layout().wide {
+            core::ptr::write_volatile(at as *mut u32, value as u32)
+        } else {
+            core::ptr::write_volatile(at as *mut u8, value)
+        }
+    }
 }
 
 /// The console. Only this program writes to it.
@@ -166,10 +196,14 @@ enum Launch {
     Run(Name),
 }
 
-fn run(_arg0: usize) -> ! {
+fn run(arg0: usize) -> ! {
+    LAYOUT.store(arg0, core::sync::atomic::Ordering::Relaxed);
     let mut out = Console;
     let bound = irq::set_notification(IRQ_CPTR, CONSOLE_BIT_CPTR).is_ok();
-    uart_write(IER, IER_RX_AVAILABLE);
+    // An XScale UART's unit enable must stay on, and it signals received bytes left below the FIFO's trigger level only
+    // through its time-out interrupt.
+    let xscale = if layout().xscale { IER_XSCALE_RX_TIMEOUT | IER_XSCALE_UNIT_ENABLE } else { 0 };
+    uart_write(IER, IER_RX_AVAILABLE | xscale);
     let _ = write!(out, "\nLanternOS. This console is the shell's alone: no app can write to it.\nType help for commands.\n");
     if !bound {
         let _ = writeln!(out, "lantern: the console's interrupt couldn't be bound; typing won't work.");
